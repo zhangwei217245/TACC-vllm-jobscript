@@ -6,7 +6,10 @@
 #SBATCH --output=slurm_jobs/vllm_%j.log
 
 
+set -x
+set -e
 
+cluster=`hostname | awk -F . '{print $2}'`
 
 # Validate input
 MODEL_NAME=$1
@@ -28,27 +31,32 @@ export UV_LINK_MODE="copy"
 
 
 export HF_HOME="$SCRATCH/huggingface/"
+mkdir -p $HF_HOME
 export HF_DATASETS_CACHE="$SCRATCH/huggingface/"
 export HF_TOKEN="<YOUR HUGGING FACE TOKEN>"
 export VLLM_CACHE_ROOT="$SCRATCH/huggingface/"
 export VLLM_USE_PRECOMPILED=True
 
-#module load nvidia/24.9  cuda/12.8  openmpi/5.0.7
-module load gcc/14.2.0  cuda/12.8  openmpi/5.0.7
-module load nvpl
+if [ "$cluster" -eq "vista" ] ; then
+       	module load nvidia/24.9  cuda/12.8  openmpi/5.0.7
+elif [ "$cluster" -eq "stampede3" ] ; then
+	module load cuda/13.1 nvidia/26.1  openmpi/5.0.7
+fi
 
 source .venv/bin/activate
 
-nodes=($(scontrol show hostnames "$SLURM_JOB_NODELIST"))
-N_NODES=${#nodes[@]}
-N_GPUS=`nvidia-smi --list-gpus | wc -l`
+export nodes=($(scontrol show hostnames "$SLURM_JOB_NODELIST"))
+export N_NODES=${#nodes[@]}
+export N_GPUS=`nvidia-smi --list-gpus | wc -l`
 
 # Configure distributed settings
 export MASTER_ADDR=${nodes[0]}
 
+export ib_dev=`ip -4 addr | grep ib | head -1 | awk -F : '{print $2}'`
 
+export head_node_ip=`ip -4 addr show dev $ib_dev | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -n1`
 
-head_node_ip=`ip -4 addr show dev ibP2s2 | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -n1`
+env
 
 # Check for GPU on head node
 if [ -e /dev/nvidia0 ]; then
@@ -58,19 +66,48 @@ else
   exit 1
 fi
 
+export NVLINK=`nvidia-smi nvlink --status | grep  Link  | wc -l`
+
+
 echo $MASTER_ADDR
 export MASTER_PORT=29500
-export NCCL_SOCKET_IFNAME=ib
-export NCCL_SOCKET_IFNAME=ibP2s2
+export NCCL_SOCKET_IFNAME=ib_dev
 export NCCL_IB_HCA=mlx5_0
 export TRITON_CACHE_DIR=/$SCRATCH/.triton/cache
-export VLLM_CACHE_ROOT/tmp/vllm-cache
+export VLLM_CACHE_ROOT=/tmp/vllm-cache
 #export NCCL_DEBUG=INFO
 
 
 
 MOE=triton
 
+if [[ ! -n "$MODEL_NAME" ]] ; then
+       echo "Model name not given"
+       exit 1;       
+fi
+
+if [[ ! -n "$N_GPUS" ]] ; then
+       echo "nvidia-smi did not report GPUs"
+       exit 1;       
+fi
+
+if [[ ! -n "$N_NODES" ]] ; then
+       echo "N_NODES not found using scontrol"
+       exit 1;       
+fi
+
+if [[ ! -n "$head_node_io" ]] ; then
+       echo "Cannot find head node IB IP"
+       exit 1;       
+fi
+
+if [[ ! -n "$MOE" ]] ; then
+       echo "MOE not defined"
+       exit 1;       
+fi
+
 echo ibrun ./vllm-start.bash $MODEL_NAME $N_GPUS $N_NODES  $head_node_ip  $MOE
 ibrun ./vllm-start.bash $MODEL_NAME $N_GPUS $N_NODES  $head_node_ip  $MOE
 
+#echo ./vllm-start.bash $MODEL_NAME $N_GPUS $N_NODES  $head_node_ip  $MOE
+#./vllm-start.bash $MODEL_NAME $N_GPUS $N_NODES  $head_node_ip  $MOE
