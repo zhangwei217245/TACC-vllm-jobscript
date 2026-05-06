@@ -1,15 +1,14 @@
 #!/bin/bash
 #SBATCH --job-name=vllm_multinode
-#SBATCH --nodes=4
-#SBATCH --partition=gh
-#SBATCH --time=24:00:00
+#SBATCH --nodes=2
+#SBATCH --partition=gh-dev
+#SBATCH --time=1:00:00
 #SBATCH --output=slurm_jobs/vllm_%j.log
 
 
 set -x
 set -e
 
-cluster=`hostname | awk -F . '{print $2}'`
 
 # Validate input
 MODEL_NAME=$1
@@ -19,32 +18,45 @@ if [ -z "$MODEL_NAME" ]; then
 fi
 
 # Setup environment
+# WEI's comment: we should use apptainer for running this so we don't have to install a venv
+# mkdir -p $SCRATCH/.uv
+# export UV_PYTHON_BIN_DIR="$SCRATCH/.uv/python_bin_dir"
+# export UV_PYTHON_CACHE_DIR="$SCRATCH/.uv/python_cache_dir"
+# export UV_CACHE_DIR="$SCRATCH/.uv/cache"
+# export UV_PYTHON_INSTALL_DIR="$SCRATCH/.uv/python_install_dir"
+# export UV_TOOL_BIN_DIR="$SCRATCH/.uv/tool_bin_dir"
+# export UV_TOOL_DIR="$SCRATCH/.uv/tool_dir"
+# export UV_LINK_MODE="copy"
 
-mkdir -p $SCRATCH/.uv
-export UV_PYTHON_BIN_DIR="$SCRATCH/.uv/python_bin_dir"
-export UV_PYTHON_CACHE_DIR="$SCRATCH/.uv/python_cache_dir"
-export UV_CACHE_DIR="$SCRATCH/.uv/cache"
-export UV_PYTHON_INSTALL_DIR="$SCRATCH/.uv/python_install_dir"
-export UV_TOOL_BIN_DIR="$SCRATCH/.uv/tool_bin_dir"
-export UV_TOOL_DIR="$SCRATCH/.uv/tool_dir"
-export UV_LINK_MODE="copy"
-
-
+# Wei's comments: This is definitely needed, but at the same time, for FlexServ, we provide better model management
+# and we use external dir for HF models
 export HF_HOME="$SCRATCH/huggingface/"
 mkdir -p $HF_HOME
 export HF_DATASETS_CACHE="$SCRATCH/huggingface/"
 export HF_TOKEN="<YOUR HUGGING FACE TOKEN>"
+
+# Wei's comment: this is very good that we have the VLLM-particular configuration
 export VLLM_CACHE_ROOT="$SCRATCH/huggingface/"
 export VLLM_USE_PRECOMPILED=True
 
-if [ "$cluster" -eq "vista" ] ; then
-       	module load nvidia/24.9  cuda/12.8  openmpi/5.0.7
-elif [ "$cluster" -eq "stampede3" ] ; then
-	module load cuda/13.1 nvidia/26.1  openmpi/5.0.7
-fi
 
-source .venv/bin/activate
 
+# Wei's comment: I believe this is more TACC-specific 
+cluster=`hostname | awk -F . '{print $2}'`
+# Wei's comment: this is not necessary for running vLLM in apptainer
+# if [ "$cluster" -eq "vista" ] ; then
+#        	module load nvidia/24.9  cuda/12.8  openmpi/5.0.7
+# elif [ "$cluster" -eq "stampede3" ] ; then
+# 	module load cuda/13.1 nvidia/26.1  openmpi/5.0.7
+# fi
+# source .venv/bin/activate
+
+module load tacc-apptainer
+
+
+
+
+# Wei's comment: useful for apptainer
 export nodes=($(scontrol show hostnames "$SLURM_JOB_NODELIST"))
 export N_NODES=${#nodes[@]}
 export N_GPUS=`nvidia-smi --list-gpus | wc -l`
