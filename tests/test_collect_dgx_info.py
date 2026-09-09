@@ -1,4 +1,7 @@
-import argparse
+import contextlib
+import io
+import os
+import tempfile
 import json
 from pathlib import Path
 import sys
@@ -18,13 +21,6 @@ class CollectorTests(unittest.TestCase):
         result = collector.run([sys.executable, '-c', 'import time; time.sleep(10)'], timeout=0.05)
         self.assertEqual(result['status'], 'timeout')
 
-    def test_partial_failure_report(self):
-        nodes = [{'target': 'dgx1', 'status': 'failed'}]
-        warnings = collector.summarize(nodes, 4)
-        self.assertIn('collected 0', warnings[0])
-        text = collector.render({'nodes': nodes, 'warnings': warnings, 'collected_at': 'now'})
-        self.assertIn('dgx1: failed', text)
-
     @patch.dict('os.environ', {'HF_TOKEN': 'never-report-this', 'MASTER_PORT': '29500'})
     @patch.object(collector, 'run')
     def test_probe_without_utilities(self, run):
@@ -35,36 +31,36 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(result['environment']['MASTER_PORT'], '29500')
         self.assertIn('error', result['storage']['/nonexistent/dgx-model'])
 
-    def test_streamed_source_executes(self):
-        # Actually run the source through stdin, as SSH/Slurm will do.
-        source = Path(collector.__file__).read_text().split('\nif __name__ ==')[0]
-        source += '\nrun = lambda *a, **k: {"status": "unavailable"}\n'
-        args = argparse.Namespace(transport='slurm', python=sys.executable, node_timeout=10)
-        actual_run = collector.run
-
-        def launch(argv, timeout, payload):
-            self.assertIn('--nodelist=dgx1', argv)
-            return actual_run([sys.executable, '-'], timeout, payload)
-
-        with patch.object(collector, 'run', side_effect=launch):
-            result = collector.collect_node('dgx1', args, source, {'command_timeout': 1})
-        self.assertEqual(result['status'], 'collected', result)
-        self.assertIn('hostname', result['inventory'])
+    @patch.object(collector, 'run')
+    def test_default_cli_writes_local_report(self, run):
+        run.return_value = {'status': 'unavailable'}
+        previous = os.getcwd()
+        with tempfile.TemporaryDirectory() as directory:
+            try:
+                os.chdir(directory)
+                with patch.object(sys, 'argv', ['collect_dgx_info.py']), \
+                     patch.object(collector.socket, 'gethostname', return_value='dgx01'), \
+                     contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(collector.main(), 0)
+                outputs = list(Path('.').glob('dgx-inventory-dgx01-*.json'))
+                self.assertEqual(len(outputs), 1)
+                report = json.loads(outputs[0].read_text())
+                self.assertEqual(report['inventory']['hostname'], 'dgx01')
+                self.assertEqual(report['schema_version'], 2)
+                self.assertIn('No GPUs', report['warnings'][0])
+                self.assertIn('Host: dgx01', Path(str(outputs[0]) + '.txt').read_text())
+                self.assertFalse(any(call.args[0][0] in ('ssh', 'srun', 'scontrol')
+                                     for call in run.call_args_list))
+            finally:
+                os.chdir(previous)
 
     @patch.object(collector, 'run')
-    def test_bad_remote_output(self, run):
-        run.return_value = {'status': 'ok', 'stdout': 'login banner\nnot JSON', 'stderr': ''}
-        args = argparse.Namespace(transport='ssh', python='python3', node_timeout=10)
-        self.assertEqual(collector.collect_node('dgx1', args, '', {})['status'], 'failed')
-
-    def test_cross_node_differences(self):
-        def node(host, driver):
-            return {'target': host, 'status': 'collected', 'inventory': {
-                'hostname': host, 'architecture': 'x86_64', 'network': {'rdma': {'mlx5_0': {}}},
-                'packages': {'vllm': 'example'}, 'gpus': [
-                    {'name': 'Example GPU', 'memory.total': '80000', 'driver_version': driver}]}}
-        findings = collector.summarize([node('dgx1', '1'), node('dgx2', '2')], 2)
-        self.assertEqual(findings, ['GPU models/memory/driver differ across nodes.'])
+    def test_output_write_failure(self, run):
+        run.return_value = {'status': 'unavailable'}
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(sys, 'argv', ['collect_dgx_info.py', '--output', directory]), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(collector.main(), 1)
 
 
 if __name__ == '__main__':

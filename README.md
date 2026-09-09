@@ -3,86 +3,78 @@ The slurm jobscript to launch VLLM on CUDA GPU enabled systems
 
 This first version works on Vista.  Will expand it to Stampede3 next.
 
-## Collect a four-node DGX inventory
+## Collect information on each DGX node
 
-`collect_dgx_info.py` requires Python 3.8+ on the collecting machine and each
-target node, with **no pip dependencies**. Run it on Linux for a complete inventory.
-It uses existing system utilities where available; missing commands and permission
-errors are recorded in the report. It does not install software, change network
-settings, start services, or run GPU workloads.
+`collect_dgx_info.py` collects information from **only the node where it runs**.
+Run the same script once on each of the four DGX nodes, then gather the reports
+for deployment planning. It requires Python 3.8+ with **no pip dependencies**.
+It does not use SSH or launch Slurm jobs/steps.
 
-Inside a Slurm allocation containing your four DGX nodes:
-
-```bash
-python3 collect_dgx_info.py --transport slurm \
-  --path '/path/to/models' --path '$SCRATCH' --output dgx-inventory.json
-```
-
-The script expands `SLURM_JOB_NODELIST` and launches one independent `srun` step
-per node. Run it once from the batch script or allocation shell, not underneath
-another multi-task `srun`. Request the GPUs you intend to inspect in your site's
-allocation options. Exclusive steps may wait if other steps hold those resources;
-the node timeout records this as a failure. Site-specific partitions, accounts,
-and GPU requests are intentionally left to your allocation script.
-
-Alternatively, use existing noninteractive SSH access:
+On each node:
 
 ```bash
-python3 collect_dgx_info.py --transport ssh \
-  --nodes dgx01 dgx02 dgx03 dgx04 \
-  --path /path/to/models --output dgx-inventory.json
+python3 collect_dgx_info.py
 ```
 
-SSH uses your normal config and known-host verification with batch mode enabled.
-Use SSH config aliases to select a username or jump host. The Python source is
-sent over standard input; no remote script installation or shared directory is
-required. The remote interpreter defaults to `python3`; select a deployment
-virtual environment with `--python /path/to/venv/bin/python`. SSH sessions may
-have a different environment from your interactive shell; load required modules
-before Slurm collection or configure the remote environment as appropriate.
+Each run writes two files to the current directory:
 
-For a single-node inspection (including inside the intended container):
+- `dgx-inventory-<hostname>-<UTC timestamp>.json`: full structured inventory.
+- `dgx-inventory-<hostname>-<UTC timestamp>.json.txt`: readable summary.
+
+Hostnames and timestamps keep reports from different nodes and runs separate,
+even when writing to a shared directory. Optionally inspect model/cache paths,
+query installed PyTorch's CUDA/NCCL runtime, or choose an output filename:
 
 ```bash
-python3 collect_dgx_info.py --transport local --expected-nodes 1 --torch-check
+python3 collect_dgx_info.py --path /path/to/models --path "$SCRATCH" --torch-check
+python3 collect_dgx_info.py --output dgx01.json
 ```
 
-`--torch-check` optionally imports installed PyTorch and queries CUDA availability,
-device count, and its NCCL version. The default only reads package metadata.
+An explicit `--output` overwrites that JSON file and its `.txt` companion; use a
+different name per node when sharing an output directory. The output directory
+must already exist.
+
+Run in the environment intended for deployment, with required modules loaded and
+GPUs allocated/visible. To inspect a virtual environment, invoke its Python:
+
+```bash
+/path/to/venv/bin/python collect_dgx_info.py
+```
+
 Host Python package versions do not describe software inside an Apptainer/Docker
-image. Run local collection inside that image as well if that is your deployment
-environment. `nvidia-smi` visibility can differ from the CUDA-visible GPU count.
+image. Run the script inside the intended image too if needed. `--torch-check`
+optionally imports PyTorch and queries CUDA availability, device count, and NCCL
+version; the default reads package metadata without importing those packages.
+`nvidia-smi` visibility can differ from the CUDA-visible GPU count.
 
-The output consists of `dgx-inventory.json` and `dgx-inventory.json.txt`:
+The inventory includes:
 
 - GPU models, UUIDs, driver versions, total/free memory in MiB, compute mode,
   MIG listing, GPU/NIC topology, and NVLink status.
 - CPU/NUMA details, architecture, RAM, memory-lock and file limits, kernel modules.
 - IP addresses/routes, NIC MTU/speed, RDMA firmware/port state, GIDs and netdev
-  mapping, DNS resolution of every target from every node, and TCP listeners.
+  mapping, and TCP listeners.
 - CUDA compiler, container utility and Python package versions, library inventory,
   selected distributed-runtime environment variables, mounts, `/dev/shm`, and
-  capacity/access checks for each `--path` (quote `$VARIABLE` for remote expansion).
-- Cross-node GPU/driver, architecture and package differences, missing GPUs/RDMA,
-  missing vLLM, duplicate hostnames, and incomplete node collection.
+  capacity/access checks for each `--path`.
+- Findings for missing GPUs, RDMA devices, or vLLM in the current Python environment.
 
-Raw command output, errors, and exit status are retained in JSON. The environment
-allowlist excludes tokens and credentials; reports still contain hostnames,
-addresses, paths, and hardware identifiers. Review them before sharing.
+Run on Linux for a complete inventory. Existing system utilities are optional;
+missing commands, permission errors, and timeouts are recorded with raw command
+output in JSON. Each command has a 15-second timeout, configurable with
+`--command-timeout`. The script does not install software, change network
+settings, start services, or run GPU workloads.
 
-The default expected count is four. Exit status is `1` if a node fails collection
-or the count differs, `2` for invalid arguments, and `0` for complete collection.
-Missing optional utilities and deployment findings do not change exit status:
-**successful collection is not a deployment readiness verdict**. DNS resolution
-does not establish peer TCP/RDMA reachability. This script does not test NCCL
-collectives, bandwidth, shared-file visibility, or whether a particular model
-fits. Use the reported interfaces/topology to choose networking settings and
-validate those separately before launching distributed inference.
+Exit status is `0` when reports are written, `1` if report writing fails, and `2`
+for invalid arguments. Missing optional utilities and inventory findings do not
+change exit status. Successful collection is not a deployment readiness verdict:
+peer connectivity, NCCL collectives/bandwidth, shared-file visibility, cross-node
+consistency, and model fit must be validated separately.
 
-Each probe defaults to a 15-second timeout and each remote node to 600 seconds;
-adjust with `--command-timeout` and `--node-timeout`. Nodes are collected with at
-most four concurrent workers. Results describe what the current user/allocation
-can see at collection time.
+The environment allowlist excludes tokens and credentials. Reports contain
+hostnames, addresses, paths, and hardware identifiers; review before sharing.
+The JSON format is now schema version 2, containing a single `inventory` object
+instead of the earlier multi-node `nodes` array.
 
 Run the standard-library tests with:
 

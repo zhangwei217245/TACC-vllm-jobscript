@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-"""Read-only distributed deployment inventory; Python 3.8+, no pip dependencies."""
+"""Read-only per-node vLLM deployment inventory; Python 3.8+, no pip dependencies."""
 
 import argparse
-import concurrent.futures
 import csv
 import datetime
 import glob
@@ -14,7 +13,6 @@ from pathlib import Path
 import platform
 import re
 import resource
-import shlex
 import shutil
 import signal
 import socket
@@ -32,15 +30,15 @@ SLURM_JOB_ID SLURM_JOB_NODELIST SLURM_JOB_NUM_NODES SLURM_JOB_GPUS
 SLURM_STEP_GPUS LOADEDMODULES""".split()
 
 
-def run(argv, timeout=15, input_text=None):
+def run(argv, timeout=15):
     """Bound command duration, including descendants of local launchers."""
     try:
-        proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, text=True, start_new_session=True)
     except OSError as exc:
         return {"status": "unavailable", "error": str(exc), "command": argv}
     try:
-        stdout, stderr = proc.communicate(input_text, timeout=timeout)
+        stdout, stderr = proc.communicate(timeout=timeout)
         status = "ok" if proc.returncode == 0 else "error"
     except subprocess.TimeoutExpired:
         os.killpg(proc.pid, signal.SIGKILL)
@@ -130,13 +128,6 @@ def probe(config):
                             "writable": os.access(path, os.W_OK)}
         except OSError as exc:
             storage[raw] = {"resolved_path": path, "error": str(exc)}
-    peers = {}
-    for host in config.get('peers', []):
-        # Separate process keeps DNS lookup bounded even with a broken resolver.
-        peers[host] = run([sys.executable, '-c',
-            'import socket,json,sys; print(json.dumps(sorted(set('
-            'x[4][0] for x in socket.getaddrinfo(sys.argv[1],None)))))', host],
-            config['command_timeout'])
     return {"hostname": socket.gethostname(), "platform": platform.platform(),
             "architecture": platform.machine(), "python": sys.version,
             "python_executable": sys.executable, "os_release": read('/etc/os-release'),
@@ -146,82 +137,38 @@ def probe(config):
                        "open_files": resource.getrlimit(resource.RLIMIT_NOFILE)},
             "environment": {k: os.environ[k] for k in ENV_KEYS if k in os.environ},
             "gpus": gpus, "network": sysfs_inventory(), "packages": packages,
-            "storage": storage, "peer_dns": peers, "commands": results}
+            "storage": storage, "commands": results}
 
 
-def collect_node(host, args, source, config):
-    payload = source + '\n' + 'print(json.dumps(probe(' + repr(config) + ')))\n'
-    if args.transport == 'ssh':
-        argv = ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', host,
-                shlex.join([args.python, '-'])]
-    else:
-        argv = ['srun', '--nodes=1', '--ntasks=1', '--nodelist=' + host,
-                '--exclusive', args.python, '-']
-    result = run(argv, args.node_timeout, payload)
-    if result['status'] != 'ok':
-        return {"target": host, "status": "failed", "transport": result}
-    try:
-        # Ignore startup banners, but never silently select an arbitrary JSON object.
-        lines = [line for line in result['stdout'].splitlines() if line.startswith('{')]
-        if len(lines) != 1:
-            raise ValueError('Expected one JSON report from remote probe')
-        report = json.loads(lines[0])
-        if not isinstance(report.get('commands'), dict):
-            raise ValueError('Invalid probe report')
-        return {"target": host, "status": "collected", "inventory": report}
-    except (ValueError, AttributeError) as exc:
-        return {"target": host, "status": "failed", "error": str(exc), "transport": result}
-
-
-def summarize(nodes, expected):
+def summarize(inv):
     warnings = []
-    good = [n for n in nodes if n['status'] == 'collected']
-    if len(good) != expected:
-        warnings.append('Expected %d nodes; collected %d.' % (expected, len(good)))
-    names = [n['inventory']['hostname'] for n in good]
-    if len(set(names)) != len(names):
-        warnings.append('Multiple targets returned the same hostname; check node aliases.')
-    signatures = {}
-    for node in good:
-        inv, host = node['inventory'], node['target']
-        if not inv['gpus']:
-            warnings.append(host + ': no GPUs inventoried; inspect nvidia-smi results.')
-        if not inv['network']['rdma']:
-            warnings.append(host + ': no RDMA devices visible in sysfs.')
-        if not inv['packages']['vllm']:
-            warnings.append(host + ': vLLM absent from probed Python (may exist in a container).')
-        signatures[host] = {
-            'GPU models/memory/driver': sorted((g['name'], g['memory.total'], g['driver_version'])
-                                               for g in inv['gpus']),
-            'architecture': inv['architecture'], 'Python packages': inv['packages']}
-    for key in ('GPU models/memory/driver', 'architecture', 'Python packages'):
-        if len({json.dumps(s[key], sort_keys=True) for s in signatures.values()}) > 1:
-            warnings.append(key + ' differ across nodes.')
+    if not inv['gpus']:
+        warnings.append('No GPUs inventoried; inspect nvidia-smi results.')
+    if not inv['network']['rdma']:
+        warnings.append('No RDMA devices visible in sysfs.')
+    if not inv['packages']['vllm']:
+        warnings.append('vLLM absent from probed Python (may exist in a container).')
     return warnings
 
 
 def render(report):
-    lines = ['DGX distributed vLLM inventory', 'Collected: ' + report['collected_at'], '']
-    for node in report['nodes']:
-        lines.append(node['target'] + ': ' + node['status'])
-        if node['status'] != 'collected':
-            lines.append('  See JSON for transport failure details.')
-            continue
-        inv = node['inventory']
-        lines.append('  Host: %s | %s | GPUs: %d' %
-                     (inv['hostname'], inv['architecture'], len(inv['gpus'])))
-        for gpu in inv['gpus']:
-            lines.append('  GPU %s: %s, total/free MiB %s/%s, driver %s' %
-                         (gpu['index'], gpu['name'], gpu['memory.total'],
-                          gpu['memory.free'], gpu['driver_version']))
-        lines.append('  RDMA devices: ' + (', '.join(inv['network']['rdma']) or 'none visible'))
-        lines.append('  Packages: ' + ', '.join('%s=%s' % (k, v or 'absent')
-                                              for k, v in inv['packages'].items()))
-        missing = [k for k, v in inv['commands'].items() if v['status'] != 'ok']
-        lines.append('  Unavailable/failed probes: ' + (', '.join(missing) or 'none'))
-    lines += ['', 'Review findings:'] + ['- ' + w for w in report['warnings']]
-    lines += ['', 'Inventory only: DNS is checked; peer TCP/RDMA connectivity, NCCL',
-              'performance, shared-file visibility, and model fit are not validated.']
+    inv = report['inventory']
+    lines = ['DGX per-node vLLM inventory', 'Collected: ' + report['collected_at'],
+             'Host: %s | %s | GPUs: %d' %
+             (inv['hostname'], inv['architecture'], len(inv['gpus']))]
+    for gpu in inv['gpus']:
+        lines.append('  GPU %s: %s, total/free MiB %s/%s, driver %s' %
+                     (gpu['index'], gpu['name'], gpu['memory.total'],
+                      gpu['memory.free'], gpu['driver_version']))
+    lines.append('RDMA devices: ' + (', '.join(inv['network']['rdma']) or 'none visible'))
+    lines.append('Packages: ' + ', '.join('%s=%s' % (k, v or 'absent')
+                                          for k, v in inv['packages'].items()))
+    missing = [k for k, v in inv['commands'].items() if v['status'] != 'ok']
+    lines.append('Unavailable/failed probes: ' + (', '.join(missing) or 'none'))
+    lines += ['', 'Review findings:'] + (['- ' + w for w in report['warnings']]
+                                         or ['- No inventory findings.'])
+    lines += ['', 'Inventory only: peer connectivity, NCCL performance, shared-file',
+              'visibility, cross-node consistency, and model fit are not validated.']
     return '\n'.join(lines) + '\n'
 
 
@@ -234,51 +181,30 @@ def positive(value):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--transport', choices=['ssh', 'slurm', 'local'], default='slurm')
-    parser.add_argument('--nodes', nargs='+', help='Explicit hostnames; Slurm defaults to allocation')
-    parser.add_argument('--expected-nodes', type=positive, default=4)
-    parser.add_argument('--python', default='python3', help='Python executable on each remote node')
     parser.add_argument('--path', dest='paths', action='append', default=[],
-                        help='Model/cache/container path to inspect on every node; repeatable')
+                        help='Local model/cache/container path to inspect; repeatable')
     parser.add_argument('--torch-check', action='store_true', help='Also import torch and query CUDA/NCCL')
     parser.add_argument('--command-timeout', type=positive, default=15)
-    parser.add_argument('--node-timeout', type=positive, default=600)
-    parser.add_argument('--output', default='dgx-inventory.json')
+    parser.add_argument('--output', help='JSON path; default: dgx-inventory-<hostname>-<UTC timestamp>.json')
     args = parser.parse_args()
-    if args.transport == 'local' and args.nodes:
-        parser.error('--nodes is not applicable to local mode')
-    hosts = args.nodes or []
-    if args.transport == 'slurm':
-        if not os.environ.get('SLURM_JOB_ID'):
-            parser.error('Slurm mode requires an active allocation; use --transport ssh otherwise')
-        if not hosts:
-            expanded = run(['scontrol', 'show', 'hostnames', os.environ.get('SLURM_JOB_NODELIST', '')])
-            if expanded['status'] != 'ok':
-                parser.error('Could not expand SLURM_JOB_NODELIST: ' + str(expanded))
-            hosts = expanded['stdout'].split()
-    if args.transport != 'local' and not hosts:
-        parser.error('--nodes is required for SSH')
-    if len(set(hosts)) != len(hosts) or any(not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]*', h) for h in hosts):
-        parser.error('Use unique plain hostnames or SSH config aliases (no user@host)')
-    config = {'paths': args.paths, 'torch_check': args.torch_check,
-              'command_timeout': args.command_timeout, 'peers': hosts}
-    if args.transport == 'local':
-        nodes = [{"target": socket.gethostname(), "status": "collected", "inventory": probe(config)}]
-    else:
-        source = Path(__file__).read_text().split('\nif __name__ ==')[0]
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(hosts), 4)) as pool:
-            nodes = list(pool.map(lambda host: collect_node(host, args, source, config), hosts))
-    report = {'schema_version': 1,
-              'collected_at': datetime.datetime.now(datetime.timezone.utc).isoformat(),
-              'transport': args.transport, 'expected_nodes': args.expected_nodes,
-              'nodes': nodes, 'warnings': summarize(nodes, args.expected_nodes)}
-    output = Path(args.output)
-    output.write_text(json.dumps(report, indent=2) + '\n')
+    inventory = probe({'paths': args.paths, 'torch_check': args.torch_check,
+                       'command_timeout': args.command_timeout})
+    now = datetime.datetime.now(datetime.timezone.utc)
+    report = {'schema_version': 2, 'collected_at': now.isoformat(),
+              'inventory': inventory, 'warnings': summarize(inventory)}
+    hostname = re.sub(r'[^A-Za-z0-9_.-]', '_', inventory['hostname'])
+    output = Path(args.output or 'dgx-inventory-%s-%s.json' %
+                  (hostname, now.strftime('%Y%m%dT%H%M%S%fZ')))
     summary = render(report)
-    output.with_suffix(output.suffix + '.txt').write_text(summary)
+    try:
+        output.write_text(json.dumps(report, indent=2) + '\n')
+        output.with_suffix(output.suffix + '.txt').write_text(summary)
+    except OSError as exc:
+        print('Could not write report: ' + str(exc), file=sys.stderr)
+        return 1
     print(summary, end='')
     print('JSON: ' + str(output))
-    return 0 if len(nodes) == args.expected_nodes and all(n['status'] == 'collected' for n in nodes) else 1
+    return 0
 
 
 if __name__ == '__main__':
