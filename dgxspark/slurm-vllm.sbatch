@@ -120,9 +120,9 @@ export NUM_NODES=${#hosts[@]}
 export SLURM_EXPORT_ENV=ALL
 export NET_TRANSPORT=${NET_TRANSPORT:-rdma}
 export MASTER_PORT=${MASTER_PORT:-8041}
-# One GPU per node: tensor-parallel across all nodes, one pipeline stage.
-export TP_SIZE=${TP_SIZE:-$NUM_NODES}
-export PP_SIZE=${PP_SIZE:-1}
+# One GPU per node: one pipeline stage per node, no tensor sharding.
+export TP_SIZE=${TP_SIZE:-1}
+export PP_SIZE=${PP_SIZE:-$NUM_NODES}
 positive_int TP_SIZE
 positive_int PP_SIZE
 (( TP_SIZE * PP_SIZE == NUM_NODES )) || die 'For this one-GPU-per-node job, TP_SIZE * PP_SIZE must equal NUM_NODES.'
@@ -148,9 +148,8 @@ case $SPEC_METHOD in
     none|ngram) ;; # These methods do not use an auxiliary model.
     *) die 'SPEC_METHOD must be none, ngram, dflash, or eagle3.' ;;
 esac
-if [[ $SPEC_METHOD != none ]] && (( PP_SIZE != 1 )); then
-    die 'The launcher speculative presets require PP_SIZE=1; use TP_SIZE=NUM_NODES.'
-fi
+# Draft PP is fixed to 1 by compatible vLLM builds, not a CLI option.
+export SPEC_TP_SIZE=${SPEC_TP_SIZE:-1}
 # UI settings are frontend-only; workers never load the middleware or UI files.
 export VLLM_UI_ENABLE=${VLLM_UI_ENABLE:-1}
 export VLLM_MIDDLEWARE_DIR=${VLLM_MIDDLEWARE_DIR:-$DEPLOY_KIT_ROOT/vllm_middleware}

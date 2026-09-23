@@ -1,8 +1,9 @@
 # Serve Qwen3-Coder-Next on DGX Spark with Slurm
 
 The batch script requests four nodes with one GPU per node and starts one
-launcher per node. vLLM uses tensor parallelism across the four GPUs; only the
-first allocated node runs the HTTP API and web UI.
+launcher per node. The primary model defaults to TP=1, PP=4 (one pipeline stage
+per node). The draft defaults to TP=1, PP=1 and runs on the last pipeline stage.
+The first allocated node runs the HTTP API and web UI.
 
 ## Repository layout and path resolution
 
@@ -52,7 +53,7 @@ bash "$DEPLOY_KIT_ROOT/utility/installer.sh"
 ```
 
 Run the installer on a Linux DGX node with GPU access under your site's
-allocation policy. It currently defaults to Python 3.14 and vLLM 0.28.0,
+allocation policy. It currently defaults to Python 3.14 and vLLM 0.30.0,
 overridable through `PYTHON_VERSION` and `VLLM_VERSION`. It creates
 `$PROJECT/.venv` and `$PROJECT/models` and checks CUDA visibility.
 
@@ -164,7 +165,7 @@ Add your site's required `--account`, `--partition` and GPU request (for example
 `--gres=gpu:1` where configured) to both submission commands. The script defaults
 to four nodes, one task per node and `--mem=0` (all schedulable host memory).
 It assumes one visible GPU per node. Overriding `--nodes` changes the default
-TP size; the model and memory capacity must support the resulting configuration.
+PP size; the model and memory capacity must support the resulting configuration.
 
 Dry-run still uses an allocation and checks CUDA, model configuration, network
 selection, UI imports and local port availability. It prints commands without
@@ -264,3 +265,28 @@ The launcher still accepts the documented `VLLM_UI_*`, `VLLM_MIDDLEWARE_DIR`, an
 attribute from the project-owned `VLLM_*` variables before starting vLLM. Update
 both the launcher and middleware together. This avoids vLLM's unknown-variable
 warnings without changing the public UI routes.
+
+## Primary and draft parallelism
+
+The four-node batch job defaults to `TP_SIZE=1`, `PP_SIZE=$NUM_NODES` (4), and
+`SPEC_TP_SIZE=1`. Direct launches default to TP equal to local visible GPUs and
+PP equal to the number of hosts. The draft JSON sets `draft_tensor_parallel_size`;
+compatible vLLM builds fix draft PP to 1 internally. There is no `SPEC_PP_SIZE` flag.
+Explicit TP/PP overrides are preserved, and target TP times PP must equal the
+total allocated GPU count.
+
+For DFlash or EAGLE3 with target PP greater than 1, the launcher selects
+`VLLM_USE_V2_MODEL_RUNNER=1` and checks that the installed vLLM creates draft PP=1
+and provides auxiliary hidden-state relay validation. Older builds fail early
+with an upgrade/fallback message. Passing this preflight does not prove the
+specific target architecture supports the relay: vLLM checks that during model
+loading. The installed version must contain these capabilities; the installer
+version pin alone is not a compatibility guarantee.
+
+```bash
+TP_SIZE=1 PP_SIZE=4 SPEC_TP_SIZE=1 SPEC_METHOD=dflash \
+    sbatch dgxspark/slurm-vllm.sbatch
+```
+
+See the [draft parallel configuration](https://docs.vllm.ai/en/latest/api/vllm/config/speculative/)
+and [V2 model runner](https://docs.vllm.ai/en/latest/api/vllm/v1/worker/gpu/model_runner/).

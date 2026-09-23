@@ -8,7 +8,7 @@
 #
 # Defaults retained: local model name, HEAD_IP=192.168.1.1,
 # MASTER_PORT=8041, HTTP range 8040-8050, RDMA, instanttensor, memory fraction .75.
-# Defaults changed: TP spans all GPUs, PP=1; 1M context uses YaRN; max sequences=1.
+# Defaults changed: TP uses local GPUs, PP spans nodes; 1M context uses YaRN; max sequences=1.
 # 1M is experimental extension of the native 256K window, not a quality guarantee.
 # Use CONTEXT_PROFILE=128k or 256k for ordinary coding without RoPE scaling.
 #
@@ -86,8 +86,8 @@ Context and performance:
   MAX_NUM_BATCHED_TOKENS              (default 4096 extended, otherwise 8192)
   BATCH_TOKENS                        (fallback alias for the setting above)
   GPU_MEM_UTILIZATION=0.75 DTYPE=auto KV_CACHE_DTYPE=auto LOAD_FORMAT=instanttensor
-  TP_SIZE                            (default total visible GPUs across nodes)
-  PP_SIZE=1                          (explicit PP must be supported by model/build)
+  TP_SIZE                            (default visible GPUs per node)
+  PP_SIZE                            (default number of nodes)
   PREFIX_CACHING=1 CHUNKED_PREFILL=1 ENFORCE_EAGER=0
   ATTENTION_BACKEND MOE_BACKEND MAMBA_CACHE_MODE (optional; retain auto selection)
   HF_OVERRIDES                       (optional JSON object, merged over auto YaRN)
@@ -116,6 +116,7 @@ Static web UI (optional, head only):
 
 Speculative decoding (default off):
   SPEC_METHOD=none|ngram|dflash|eagle3
+  SPEC_TP_SIZE=1                     (draft TP; draft PP is fixed to 1 by vLLM)
   SPEC_TOKENS                        (defaults: ngram=4, dflash=15, eagle3=3)
   SPEC_MODEL                         (Hugging Face ID or absolute local draft directory)
   NGRAM_MIN=2 NGRAM_MAX=5
@@ -243,8 +244,8 @@ export -n VLLM_UI_ENABLE VLLM_UI_MODEL VLLM_UI_DIR VLLM_UI_PAGE \
     VLLM_PUBLIC_BASE_URL VLLM_MIDDLEWARE_DIR
 NUM_GPUS=$("$PYTHON" -c 'import torch; print(torch.cuda.device_count())')
 positive_int NUM_GPUS
-TP_SIZE=${TP_SIZE:-$((NUM_NODES * NUM_GPUS))}
-PP_SIZE=${PP_SIZE:-1}
+TP_SIZE=${TP_SIZE:-$NUM_GPUS}
+PP_SIZE=${PP_SIZE:-$NUM_NODES}
 positive_int TP_SIZE
 positive_int PP_SIZE
 (( TP_SIZE * PP_SIZE == NUM_NODES * NUM_GPUS )) ||
@@ -367,7 +368,6 @@ SPEC_CONFIG=
 case $SPEC_METHOD in
     none) [[ -z ${SPEC_MODEL:-} && -z ${SPEC_TOKENS:-} ]] || die 'SPEC_MODEL/TOKENS require a speculative method.' ;;
     ngram|dflash|eagle3)
-        (( PP_SIZE == 1 )) || die 'This speculative preset requires PP_SIZE=1.'
         case $SPEC_METHOD in
             ngram)
                 [[ -z ${SPEC_MODEL:-} ]] || die 'N-gram drafting does not use SPEC_MODEL.'
@@ -381,18 +381,50 @@ case $SPEC_METHOD in
                 SPEC_MODEL=${SPEC_MODEL:-togethercomputer/Aurora-Spec-Qwen3-Coder-Next-FP8}
                 warn 'Aurora EAGLE3 author documents SGLang; validate this vLLM combination.' ;;
         esac
+        SPEC_TP_SIZE=${SPEC_TP_SIZE:-1}
+        positive_int SPEC_TP_SIZE
+        if [[ $SPEC_METHOD != ngram ]]; then
+            (( SPEC_TP_SIZE == 1 || SPEC_TP_SIZE == TP_SIZE )) ||
+                die 'SPEC_TP_SIZE must be 1 or match target TP_SIZE.'
+            if (( PP_SIZE > 1 )); then
+                export VLLM_USE_V2_MODEL_RUNNER=${VLLM_USE_V2_MODEL_RUNNER:-1}
+                [[ $VLLM_USE_V2_MODEL_RUNNER == 1 ]] ||
+                    die 'Model-based speculation with PP>1 requires VLLM_USE_V2_MODEL_RUNNER=1.'
+            fi
+        fi
         positive_int SPEC_TOKENS
         NGRAM_MIN=${NGRAM_MIN:-2}; NGRAM_MAX=${NGRAM_MAX:-5}
         positive_int NGRAM_MIN; positive_int NGRAM_MAX
         (( NGRAM_MIN <= NGRAM_MAX )) || die 'NGRAM_MIN must not exceed NGRAM_MAX.'
-        SPEC_CONFIG=$("$PYTHON" - "$SPEC_METHOD" "$SPEC_TOKENS" "$SPEC_MODEL" "$NGRAM_MIN" "$NGRAM_MAX" <<'PY'
+        SPEC_CONFIG=$("$PYTHON" - "$SPEC_METHOD" "$SPEC_TOKENS" "$SPEC_MODEL" "$NGRAM_MIN" "$NGRAM_MAX" "$SPEC_TP_SIZE" "$TP_SIZE" "$PP_SIZE" <<'PY'
 import json, sys
-method, tokens, model, low, high = sys.argv[1:]
+method, tokens, model, low, high, draft_tp, target_tp, target_pp = sys.argv[1:]
 config = dict(method=method, num_speculative_tokens=int(tokens))
 if method == 'ngram':
     config.update(prompt_lookup_min=int(low), prompt_lookup_max=int(high))
 else:
     config['model'] = model
+    config['draft_tensor_parallel_size'] = int(draft_tp)
+    if int(target_pp) > 1:
+        # Check the installed API, not a guessed minimum version. No weights loaded.
+        try:
+            from vllm.config import ParallelConfig, SpeculativeConfig
+            from vllm.v1.worker.gpu import model_runner
+            target = ParallelConfig(tensor_parallel_size=int(target_tp),
+                                    pipeline_parallel_size=int(target_pp),
+                                    distributed_executor_backend='mp')
+            draft = SpeculativeConfig.create_draft_parallel_config(target, int(draft_tp))
+            if draft.pipeline_parallel_size != 1:
+                raise RuntimeError('this build inherits target PP for the draft')
+            if not callable(getattr(model_runner, 'verify_supports_aux_hidden_states_over_pp', None)):
+                raise RuntimeError('Model Runner V2 lacks auxiliary hidden-state relay validation')
+        except (ImportError, AttributeError, TypeError, ValueError, RuntimeError) as exc:
+            sys.exit(f'PP/speculation preflight failed: {exc}. Install a vLLM build '
+                     'with draft PP=1 and auxiliary hidden-state relay across PP stages, '
+                     'or use SPEC_METHOD=none / PP_SIZE=1.')
+        print(f'Speculative parallelism: target TP={target_tp} PP={target_pp}; '
+              f'draft TP={draft_tp} PP=1. Model-specific relay support is checked '
+              'by vLLM during model loading.', file=sys.stderr)
 print(json.dumps(config, separators=(',', ':')))
 PY
         )
@@ -405,7 +437,7 @@ esac
 # Same engine arguments on all ranks. Frontend-only options are added on rank 0.
 engine_args=(
     --tensor-parallel-size "$TP_SIZE"             # Total ranks sharding tensors.
-    --pipeline-parallel-size "$PP_SIZE"           # Pipeline stages (default 1).
+    --pipeline-parallel-size "$PP_SIZE"           # Pipeline stages (default number of nodes).
     --distributed-executor-backend mp             # Per-node multiprocessing, no Ray.
     --nnodes "$NUM_NODES"                        # Number of participating hosts.
     --master-addr "$HEAD_IP"                      # Shared rendezvous address, owned by head.
