@@ -121,8 +121,8 @@ export SLURM_EXPORT_ENV=ALL
 export NET_TRANSPORT=${NET_TRANSPORT:-rdma}
 export MASTER_PORT=${MASTER_PORT:-8041}
 # One GPU per node: one pipeline stage per node, no tensor sharding.
-export TP_SIZE=${TP_SIZE:-1}
-export PP_SIZE=${PP_SIZE:-$NUM_NODES}
+export TP_SIZE=${TP_SIZE:-$NUM_NODES}
+export PP_SIZE=${PP_SIZE:-1}
 positive_int TP_SIZE
 positive_int PP_SIZE
 (( TP_SIZE * PP_SIZE == NUM_NODES )) || die 'For this one-GPU-per-node job, TP_SIZE * PP_SIZE must equal NUM_NODES.'
