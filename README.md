@@ -3,6 +3,17 @@ The slurm jobscript to launch VLLM on CUDA GPU enabled systems
 
 This first version works on Vista.  Will expand it to Stampede3 next.
 
+## Generate a vLLM deployment configuration
+
+[configure_vllm.py](configure_vllm.py) uses the per-node inventories below, a
+Docker runtime probe, model metadata and workload targets to generate explained
+configuration candidates and local launch scripts. It can then select the best
+validated benchmark result under your latency limits. No SSH or pip dependencies
+are needed on the planning machine.
+
+See [CONFIGURATOR.md](CONFIGURATOR.md) for the workflow and
+[examples/deployment.json](examples/deployment.json) for the editable input.
+
 ## Collect information on each DGX node
 
 `collect_dgx_info.py` collects information from **only the node where it runs**.
