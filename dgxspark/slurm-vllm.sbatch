@@ -80,6 +80,28 @@ PROJECT=${PROJECT:-$DEPLOY_KIT_ROOT}
 PROJECT=$(cd -- "$PROJECT" && pwd)
 export LAUNCHER NETWORK_SCRIPT DEPLOY_KIT_ROOT PROJECT
 
+# First two model IDs select the target and optional auxiliary checkpoint.
+# Explicit submission-time model overrides still take precedence.
+MODEL_REPO=${MODEL_REPO:-$PROJECT/models}
+[[ $MODEL_REPO == /* ]] || MODEL_REPO=$PWD/$MODEL_REPO
+MODEL_LIST=${MODEL_LIST:-$PROJECT/models/models.txt}
+[[ $MODEL_LIST == /* ]] || MODEL_LIST=$PWD/$MODEL_LIST
+[[ -f $MODEL_LIST && -r $MODEL_LIST ]] || die "Model list missing or unreadable: $MODEL_LIST"
+model_ids=()
+while IFS= read -r repo_id || [[ -n $repo_id ]]; do
+    repo_id="${repo_id#"${repo_id%%[![:space:]]*}"}"
+    repo_id="${repo_id%"${repo_id##*[![:space:]]}"}"
+    [[ -n $repo_id && $repo_id != \#* ]] || continue
+    [[ $repo_id =~ ^[[:alnum:]_][[:alnum:]_.-]*/[[:alnum:]_][[:alnum:]_.-]*$ ]] ||
+        die "Expected organization/model in $MODEL_LIST: $repo_id"
+    model_ids+=("$repo_id")
+done < "$MODEL_LIST"
+(( ${#model_ids[@]} > 0 )) || die "Model list has no primary model: $MODEL_LIST"
+MODEL_NAME=${MODEL_NAME:-${model_ids[0]//\//--}}
+MODEL_PATH=${MODEL_PATH:-$MODEL_REPO/$MODEL_NAME}
+[[ $MODEL_PATH == /* ]] || MODEL_PATH=$PWD/$MODEL_PATH
+export MODEL_LIST MODEL_REPO MODEL_NAME MODEL_PATH
+
 run_dir=$JOB_WORK_DIR/vllm-run-$SLURM_JOB_ID
 mkdir -p -- "$run_dir"
 export HOSTFILE=$run_dir/hosts.txt
@@ -112,10 +134,20 @@ export MAX_NUM_SEQS=${MAX_NUM_SEQS:-8}
 export MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS:-8192}
 export CONTEXT_PROFILE=${CONTEXT_PROFILE:-1m}
 export SPEC_METHOD=${SPEC_METHOD:-dflash}
-if [[ $SPEC_METHOD == dflash ]]; then
-    export SPEC_TOKENS=${SPEC_TOKENS:-15}
-    export SPEC_MODEL=${SPEC_MODEL:-$PROJECT/models/Qwen3-Coder-Next-DFlash}
-fi
+case $SPEC_METHOD in
+    dflash|eagle3)
+        if [[ -z ${SPEC_MODEL:-} ]]; then
+            (( ${#model_ids[@]} >= 2 )) ||
+                die "SPEC_METHOD=$SPEC_METHOD requires a second model in $MODEL_LIST or an explicit SPEC_MODEL."
+            SPEC_MODEL=$MODEL_REPO/${model_ids[1]//\//--}
+        fi
+        export SPEC_MODEL
+        if [[ $SPEC_METHOD == dflash ]]; then
+            export SPEC_TOKENS=${SPEC_TOKENS:-15}
+        fi ;;
+    none|ngram) ;; # These methods do not use an auxiliary model.
+    *) die 'SPEC_METHOD must be none, ngram, dflash, or eagle3.' ;;
+esac
 if [[ $SPEC_METHOD != none ]] && (( PP_SIZE != 1 )); then
     die 'The launcher speculative presets require PP_SIZE=1; use TP_SIZE=NUM_NODES.'
 fi

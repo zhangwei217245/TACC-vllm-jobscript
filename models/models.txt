@@ -1,0 +1,5 @@
+# One organization/model ID per nonblank, non-comment line.
+# First entry: primary model to serve. Second entry: auxiliary draft model.
+# Later entries are downloaded but are not selected automatically for serving.
+Qwen/Qwen3-Coder-Next-FP8
+z-lab/Qwen3-Coder-Next-DFlash

@@ -11,7 +11,8 @@ TACC-vllm-jobscript/
 ├── dgxspark/
 │   ├── slurm-vllm.sbatch
 │   └── launch-vllm.sh
-├── models/                 # download destinations used below
+├── models/                 # downloaded checkpoints
+│   └── models.txt          # ordered model IDs
 ├── utility/
 │   ├── installer.sh
 │   ├── inference-network.sh
@@ -69,38 +70,60 @@ This serving override does not change the installer or downloader destinations.
 
 ## 2. Download the model
 
-Download the complete target checkpoint with the environment's Hugging Face CLI:
+Edit `models/models.txt`, with one Hugging Face `organization/model` ID per line:
 
-```bash
-export MODEL_NAME=Qwen3-Coder-Next-FP8
-export MODEL_PATH="$PROJECT/models/$MODEL_NAME"
-df -h "$PROJECT"
-"$PROJECT/.venv/bin/hf" download Qwen/Qwen3-Coder-Next-FP8 \
-    --local-dir "$MODEL_PATH"
-test -r "$MODEL_PATH/config.json"
-du -sh "$MODEL_PATH"
+```text
+Qwen/Qwen3-Coder-Next-FP8
+z-lab/Qwen3-Coder-Next-DFlash
 ```
 
-If `hf` is missing, install it with
-`"$PROJECT/.venv/bin/python" -m pip install huggingface_hub`.
-For repositories requiring authentication, first run
-`"$PROJECT/.venv/bin/hf" auth login`. Download once to shared storage, or copy
-the complete checkpoint to the same path on every node. See the
-[Hugging Face CLI documentation](https://huggingface.co/docs/huggingface_hub/guides/cli)
-and [target checkpoint](https://huggingface.co/Qwen/Qwen3-Coder-Next-FP8).
+The order of nonblank, non-comment entries defines their roles:
 
-Alternatively, run `bash "$DEPLOY_KIT_ROOT/utility/download_model.sh"` to download
-both configured models (Qwen3.8-Flash-Next-FP8 and Qwen3-Coder-Next-FP8). It uses
-the repository-root `.venv/bin/hf` and writes into repository-root `models/`.
+1. The first model is the primary model to serve.
+2. The second model is the auxiliary draft model for model-based speculative decoding.
+3. Additional models are downloaded but are not automatically selected for serving.
 
-The baseline below disables speculation and needs no draft model. For the batch
-script's DFlash preset, also download the complete draft checkpoint:
+Blank lines and full-line `#` comments do not count toward this order. Downloads
+run sequentially and stop on the first failure. Every `/` becomes `--` in the
+local folder name. For example, `Qwen/Qwen3-Coder-Next-FP8` is stored in
+`models/Qwen--Qwen3-Coder-Next-FP8`.
 
 ```bash
-export SPEC_MODEL="$PROJECT/models/Qwen3-Coder-Next-DFlash"
-"$PROJECT/.venv/bin/hf" download z-lab/Qwen3-Coder-Next-DFlash \
-    --local-dir "$SPEC_MODEL"
+bash "$DEPLOY_KIT_ROOT/utility/download_model.sh"
+# Or download a custom list:
+bash "$DEPLOY_KIT_ROOT/utility/download_model.sh" /path/to/models.txt
 ```
+
+The downloader uses repository-root `.venv/bin/hf`. If `hf` is missing, install
+it with `"$PROJECT/.venv/bin/python" -m pip install huggingface_hub`. For private
+or gated repositories, first run `"$PROJECT/.venv/bin/hf" auth login`.
+
+`slurm-vllm.sbatch` reads `$PROJECT/models/models.txt` by default. Set `MODEL_LIST`
+to use a custom file; relative paths resolve against `SLURM_SUBMIT_DIR`.
+It derives these defaults from the example above:
+
+```text
+MODEL_NAME=Qwen--Qwen3-Coder-Next-FP8
+MODEL_PATH=$PROJECT/models/Qwen--Qwen3-Coder-Next-FP8
+SPEC_MODEL=$PROJECT/models/z-lab--Qwen3-Coder-Next-DFlash
+SERVED_MODEL_NAME=Qwen3-Coder-Next-FP8
+```
+
+The launcher strips the first `author--` prefix from `MODEL_NAME` for the default
+API/UI `SERVED_MODEL_NAME`. Explicit `MODEL_NAME`, `MODEL_PATH`, `SPEC_MODEL`, and
+`SERVED_MODEL_NAME` overrides take precedence. `MODEL_REPO` overrides the checkpoint
+parent directory; it does not change the default list location.
+
+The batch script uses the second entry for `SPEC_METHOD=dflash` (the default) or
+`SPEC_METHOD=eagle3` (EAGLE3). Select the method explicitly to match the auxiliary
+checkpoint; the list does not infer it. These methods require a second entry
+unless `SPEC_MODEL` is explicitly supplied. `SPEC_METHOD=none` and `ngram` do not
+use the second entry and allow a one-model list. Do not export `SPEC_MODEL` for
+those methods. DSpark is not currently a supported launcher preset; this list
+change does not add a DSpark backend.
+
+Keep the complete downloaded checkpoints at the same paths on every node. The
+model list is tracked in Git; downloaded model folders and `.venv/` are ignored.
 
 ## 3. Inspect networking and submit a preflight job
 

@@ -75,8 +75,8 @@ Paths and membership:
   HOSTFILE=hosts.txt                  (beside launcher unless overridden)
   LOCAL_NODE_NAME                     (optional override for Slurm aliases)
   HEAD_IP=192.168.1.1 MASTER_PORT=8041 (same on all nodes; head owns HEAD_IP)
-  MODEL_NAME=Qwen3-Coder-Next-FP8 MODEL_REPO=$PROJECT/models MODEL_PATH=...
-  SERVED_MODEL_NAME=$MODEL_NAME       (preserves the original API model name)
+  MODEL_NAME=Qwen--Qwen3-Coder-Next-FP8 MODEL_REPO=$PROJECT/models MODEL_PATH=...
+  SERVED_MODEL_NAME                   (default MODEL_NAME without author-- prefix)
 
 Context and performance:
   CONTEXT_PROFILE=128k|256k|512k|1m    (default 1m; explicit MAX_MODEL_LEN wins)
@@ -161,13 +161,13 @@ PROJECT=${PROJECT:-$DEPLOY_KIT_ROOT}
 PROJECT=$(cd -- "$PROJECT" && pwd)
 NETWORK_SCRIPT=${NETWORK_SCRIPT:-$DEPLOY_KIT_ROOT/utility/inference-network.sh}
 HOSTFILE=${HOSTFILE:-$LAUNCH_DIR/hosts.txt}
-MODEL_NAME=${MODEL_NAME:-Qwen3-Coder-Next-FP8}
+MODEL_NAME=${MODEL_NAME:-Qwen--Qwen3-Coder-Next-FP8}
 MODEL_REPO=${MODEL_REPO:-$PROJECT/models}
 MODEL_PATH=${MODEL_PATH:-$MODEL_REPO/$MODEL_NAME}
 for path_name in NETWORK_SCRIPT HOSTFILE MODEL_PATH; do
     [[ ${!path_name} == /* ]] || printf -v "$path_name" '%s/%s' "$PWD" "${!path_name}"
 done
-SERVED_MODEL_NAME=${SERVED_MODEL_NAME:-$MODEL_NAME}
+SERVED_MODEL_NAME=${SERVED_MODEL_NAME:-${MODEL_NAME#*--}}
 HEAD_IP=${HEAD_IP:-192.168.1.1}
 MASTER_PORT=${MASTER_PORT:-8041}
 positive_int MASTER_PORT

@@ -3,7 +3,7 @@
 set -Eeuo pipefail
 
 readonly PYTHON_VERSION="${PYTHON_VERSION:-3.14}"
-readonly VLLM_VERSION="${VLLM_VERSION:-0.28.0}"
+readonly VLLM_VERSION="${VLLM_VERSION:-0.30.0}"
 readonly PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 readonly VENV_DIR="${PROJECT_DIR}/.venv"
 readonly MODELS_DIR="${PROJECT_DIR}/models"
