@@ -21,7 +21,10 @@ inference-network.sh
 ```
 
 ```
-sbatch --time=0 slurm-vllm.sbatch
+mkdir -p "$PWD/logs"
+
+sbatch --time=0 --chdir="$PWD/logs" \
+    "$PWD/dgxspark/slurm-vllm.sbatch"
 ```
 
 Logs will shown in vllm-{JOBID} directory. 

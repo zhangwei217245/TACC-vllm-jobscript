@@ -28,6 +28,13 @@
 #     SPEC_MODEL=/opt/share/gits/Agentic/vllm/models/Qwen3-Coder-Next-DFlash \
 #     bash launch-vllm.sh
 #   export VLLM_API_KEY='private-key'  # optional; never printed by this launcher
+# Static UI on the head's existing HTTP port (enabled by default for this kit):
+#   VLLM_UI_ENABLE=0 bash dgxspark/launch-vllm.sh  # Disable UI.
+#   VLLM_UI_PAGE=chat.html bash dgxspark/launch-vllm.sh
+#   VLLM_PUBLIC_BASE_URL=https://llm.example.org bash dgxspark/launch-vllm.sh
+# Layout: dgxspark/launch-vllm.sh, vllm_middleware/static_ui.py, ui/chat.html.
+# The page reads public API URL/model settings from /ui/config.json; no API key.
+# Without VLLM_PUBLIC_BASE_URL, the UI uses the browser's current server address.
 # Generate hosts.txt ONCE per Slurm allocation; distribute the same ordering:
 #   scontrol show hostnames "$SLURM_JOB_NODELIST" > hosts.txt
 #
@@ -89,6 +96,21 @@ Tools, sampling, and API:
   VLLM_API_KEY                        (optional, passed only on head; redacted)
   No reasoning parser: official Coder-Next is a non-thinking checkpoint.
 
+Static web UI (optional, head only):
+  DEPLOY_KIT_ROOT                     (default parent of this script's directory)
+  VLLM_UI_ENABLE=1                    (0 disables the UI)
+  VLLM_MIDDLEWARE_DIR=$DEPLOY_KIT_ROOT/vllm_middleware
+  VLLM_UI_DIR=$DEPLOY_KIT_ROOT/ui      (only this directory is served)
+  VLLM_UI_PAGE=chat.html              (entry HTML file relative to VLLM_UI_DIR)
+  VLLM_PUBLIC_BASE_URL                (optional browser-facing server root, WITHOUT /v1)
+  Example: https://llm.example.org or https://gateway.example.org/qwen
+  Empty public URL means same-origin; no dependence on bind address or local NIC.
+  Relative directory overrides use caller cwd. Defaults use repo layout above.
+  Serves /ui/ -> /ui/chat.html and /ui/config.json. No SPA route fallback.
+  UI files are public; API requests still pass through vLLM authentication.
+  Serve only frontend build output. Never put API keys in bundled UI assets.
+  Workers need neither the UI directory nor middleware.
+
 Speculative decoding (default off):
   SPEC_METHOD=none|ngram|dflash|eagle3
   SPEC_TOKENS                        (defaults: ngram=4, dflash=15, eagle3=3)
@@ -121,6 +143,17 @@ esac
 
 # Resolve caller-relative paths before moving into the project directory.
 LAUNCH_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+DEPLOY_KIT_ROOT=${DEPLOY_KIT_ROOT:-$(cd -- "$LAUNCH_DIR/.." && pwd)}
+[[ $DEPLOY_KIT_ROOT == /* ]] || DEPLOY_KIT_ROOT=$PWD/$DEPLOY_KIT_ROOT
+VLLM_UI_ENABLE=${VLLM_UI_ENABLE:-1}
+boolean VLLM_UI_ENABLE
+VLLM_MIDDLEWARE_DIR=${VLLM_MIDDLEWARE_DIR:-$DEPLOY_KIT_ROOT/vllm_middleware}
+VLLM_UI_DIR=${VLLM_UI_DIR:-$DEPLOY_KIT_ROOT/ui}
+VLLM_UI_PAGE=${VLLM_UI_PAGE:-chat.html}
+VLLM_PUBLIC_BASE_URL=${VLLM_PUBLIC_BASE_URL:-}
+for path_name in VLLM_MIDDLEWARE_DIR VLLM_UI_DIR; do
+    [[ ${!path_name} == /* ]] || printf -v "$path_name" '%s/%s' "$PWD" "${!path_name}"
+done
 PROJECT=${PROJECT:-/opt/share/gits/Agentic/vllm}
 [[ -d $PROJECT ]] || die "Project directory missing: $PROJECT"
 PROJECT=$(cd -- "$PROJECT" && pwd)
@@ -185,6 +218,21 @@ VLLM=$PROJECT/.venv/bin/vllm
 [[ -r $MODEL_PATH/config.json ]] || die "Model config missing: $MODEL_PATH/config.json"
 source "$PROJECT/.venv/bin/activate"
 cd -- "$PROJECT"
+# Validate optional frontend before CUDA/model startup. Workers have no HTTP app.
+if (( NODE_RANK == 0 && VLLM_UI_ENABLE )); then
+    [[ -r $VLLM_MIDDLEWARE_DIR/static_ui.py ]] || die "Middleware missing: $VLLM_MIDDLEWARE_DIR/static_ui.py"
+    export VLLM_UI_DIR VLLM_UI_PAGE VLLM_PUBLIC_BASE_URL
+    export VLLM_UI_MODEL=$SERVED_MODEL_NAME  # Public model ID, never the API key.
+    # Import static_ui from the dedicated middleware directory; no __init__.py needed.
+    export PYTHONPATH="$VLLM_MIDDLEWARE_DIR${PYTHONPATH:+:$PYTHONPATH}"
+    "$PYTHON" - "$VLLM_MIDDLEWARE_DIR/static_ui.py" <<'PY'
+import pathlib, sys
+import static_ui
+if pathlib.Path(static_ui.__file__).resolve() != pathlib.Path(sys.argv[1]).resolve():
+    sys.exit('Another static_ui module shadows the launcher middleware; check PROJECT/PYTHONPATH.')
+static_ui.StaticUIMiddleware(app=None)  # Checks dependencies and static directory.
+PY
+fi
 NUM_GPUS=$("$PYTHON" -c 'import torch; print(torch.cuda.device_count())')
 positive_int NUM_GPUS
 TP_SIZE=${TP_SIZE:-$((NUM_NODES * NUM_GPUS))}
@@ -446,8 +494,20 @@ if (( NODE_RANK == 0 )); then
     (( ! ENABLE_AUTO_TOOL_CHOICE )) || vllm_args+=(--enable-auto-tool-choice) # Model chooses tools.
     (( ! PROMPT_TOKENS_DETAILS )) || vllm_args+=(--enable-prompt-tokens-details) # Cache usage reporting.
     [[ -z ${VLLM_API_KEY:-} ]] || vllm_args+=(--api-key "$VLLM_API_KEY") # Auth on supported API routes.
+    if (( VLLM_UI_ENABLE )); then
+        vllm_args+=(--middleware static_ui.StaticUIMiddleware) # Serve /ui/ on the API port.
+    fi
     endpoint=${INFER_HTTP_URL:-http://$INFER_HTTP_HOST:$INFER_HTTP_PORT}
     printf 'HTTP candidate: %s (external reachability unverified); model=%s\n' "$endpoint" "$SERVED_MODEL_NAME" >&2
+    if (( VLLM_UI_ENABLE )); then
+        ui_base=${VLLM_PUBLIC_BASE_URL:-$endpoint}
+        printf 'Static UI: %s/ui/; directory=%s; entry=%s (public files)\n' "${ui_base%/}" "$VLLM_UI_DIR" "$VLLM_UI_PAGE" >&2
+        if [[ -n $VLLM_PUBLIC_BASE_URL ]]; then
+            printf 'UI API base: %s/v1\n' "${VLLM_PUBLIC_BASE_URL%/}" >&2
+        else
+            printf 'UI API base: browser same-origin address (supports SSH tunnels and public proxies).\n' >&2
+        fi
+    fi
     printf 'Set client context to %s including output; update its compaction threshold too.\n' "$MAX_MODEL_LEN" >&2
 else
     vllm_args+=(--headless)                       # Worker engine only, no HTTP frontend.
