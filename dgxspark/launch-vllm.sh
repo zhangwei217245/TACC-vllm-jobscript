@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # Per-node Qwen3-Coder-Next launcher. Bash >=4; NVIDIA CUDA; local vLLM venv.
 # Run on EVERY node. This script launches no remote processes and requests no allocation.
-# Keep inference-network.sh and the SAME ordered hosts.txt beside it on all nodes.
+# Keep the repository layout and the SAME ordered hosts.txt on all nodes.
+# The network helper lives at ../utility/inference-network.sh relative to this script.
 # The helper configures local NICs; the first host in hosts.txt is the head.
 # All nodes need identical model weights/configuration and serving settings.
 #
-# Defaults retained: PROJECT, local model path, HEAD_IP=192.168.1.1,
+# Defaults retained: local model name, HEAD_IP=192.168.1.1,
 # MASTER_PORT=8041, HTTP range 8040-8050, RDMA, instanttensor, memory fraction .75.
 # Defaults changed: TP spans all GPUs, PP=1; 1M context uses YaRN; max sequences=1.
 # 1M is experimental extension of the native 256K window, not a quality guarantee.
@@ -21,11 +22,11 @@
 #   CONTEXT_PROFILE=128k SPEC_METHOD=ngram bash launch-vllm.sh
 # Download a complete draft checkpoint once into shared storage (or on each node):
 #   hf download z-lab/Qwen3-Coder-Next-DFlash \
-#     --local-dir /opt/share/gits/Agentic/vllm/models/Qwen3-Coder-Next-DFlash
+#     --local-dir "$PROJECT/models/Qwen3-Coder-Next-DFlash"
 # Downloading locally does not establish FP8/GB10 compatibility.
 # Use the same absolute directory on every node:
 #   CONTEXT_PROFILE=128k SPEC_METHOD=dflash \
-#     SPEC_MODEL=/opt/share/gits/Agentic/vllm/models/Qwen3-Coder-Next-DFlash \
+#     SPEC_MODEL="$PROJECT/models/Qwen3-Coder-Next-DFlash" \
 #     bash launch-vllm.sh
 #   export VLLM_API_KEY='private-key'  # optional; never printed by this launcher
 # Static UI on the head's existing HTTP port (enabled by default for this kit):
@@ -69,8 +70,9 @@ Dry-run runs local checks (including the network helper) and prints a redacted
 command. It loads no weights, starts no vLLM, and does not reserve ports.
 
 Paths and membership:
-  PROJECT=/opt/share/gits/Agentic/vllm   (.venv/bin/python and vllm required)
-  NETWORK_SCRIPT=inference-network.sh HOSTFILE=hosts.txt (beside launcher)
+  PROJECT=$DEPLOY_KIT_ROOT            (repo root; .venv/bin/python and vllm required)
+  NETWORK_SCRIPT=$DEPLOY_KIT_ROOT/utility/inference-network.sh
+  HOSTFILE=hosts.txt                  (beside launcher unless overridden)
   LOCAL_NODE_NAME                     (optional override for Slurm aliases)
   HEAD_IP=192.168.1.1 MASTER_PORT=8041 (same on all nodes; head owns HEAD_IP)
   MODEL_NAME=Qwen3-Coder-Next-FP8 MODEL_REPO=$PROJECT/models MODEL_PATH=...
@@ -154,10 +156,10 @@ VLLM_PUBLIC_BASE_URL=${VLLM_PUBLIC_BASE_URL:-}
 for path_name in VLLM_MIDDLEWARE_DIR VLLM_UI_DIR; do
     [[ ${!path_name} == /* ]] || printf -v "$path_name" '%s/%s' "$PWD" "${!path_name}"
 done
-PROJECT=${PROJECT:-/opt/share/gits/Agentic/vllm}
+PROJECT=${PROJECT:-$DEPLOY_KIT_ROOT}
 [[ -d $PROJECT ]] || die "Project directory missing: $PROJECT"
 PROJECT=$(cd -- "$PROJECT" && pwd)
-NETWORK_SCRIPT=${NETWORK_SCRIPT:-$LAUNCH_DIR/inference-network.sh}
+NETWORK_SCRIPT=${NETWORK_SCRIPT:-$DEPLOY_KIT_ROOT/utility/inference-network.sh}
 HOSTFILE=${HOSTFILE:-$LAUNCH_DIR/hosts.txt}
 MODEL_NAME=${MODEL_NAME:-Qwen3-Coder-Next-FP8}
 MODEL_REPO=${MODEL_REPO:-$PROJECT/models}

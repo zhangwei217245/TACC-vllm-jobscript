@@ -9,8 +9,8 @@
 # --mem=0 requests all schedulable host memory on each allocated node.
 # Submit from the repo root OR dgxspark/. For another working directory, export
 # LAUNCHER=/absolute/path/to/repo/dgxspark/launch-vllm.sh or DEPLOY_KIT_ROOT.
-# Repo layout: dgxspark/{launch-vllm.sh,inference-network.sh,slurm-vllm.sbatch},
-#             vllm_middleware/static_ui.py, ui/chat.html.
+# Repo layout: dgxspark/{launch-vllm.sh,slurm-vllm.sbatch},
+#             utility/inference-network.sh, vllm_middleware/static_ui.py, ui/chat.html.
 # PROJECT, its venv, weights and this kit must be available on every node.
 #
 # Logs use Slurm's initial working directory (--chdir), captured before any cd:
@@ -69,13 +69,16 @@ fi
 [[ -r $LAUNCHER ]] || die "Launcher missing: $LAUNCHER"
 launcher_dir=$(cd -- "$(dirname -- "$LAUNCHER")" && pwd)
 LAUNCHER=$launcher_dir/$(basename -- "$LAUNCHER")
-NETWORK_SCRIPT=${NETWORK_SCRIPT:-$launcher_dir/inference-network.sh}
 DEPLOY_KIT_ROOT=${DEPLOY_KIT_ROOT:-$(cd -- "$launcher_dir/.." && pwd)}
-for name in NETWORK_SCRIPT DEPLOY_KIT_ROOT; do
-    [[ ${!name} == /* ]] || printf -v "$name" '%s/%s' "$PWD" "${!name}"
-done
+[[ $DEPLOY_KIT_ROOT == /* ]] || DEPLOY_KIT_ROOT=$PWD/$DEPLOY_KIT_ROOT
+NETWORK_SCRIPT=${NETWORK_SCRIPT:-$DEPLOY_KIT_ROOT/utility/inference-network.sh}
+[[ $NETWORK_SCRIPT == /* ]] || NETWORK_SCRIPT=$PWD/$NETWORK_SCRIPT
 [[ -r $NETWORK_SCRIPT ]] || die "Network helper missing: $NETWORK_SCRIPT"
-export LAUNCHER NETWORK_SCRIPT DEPLOY_KIT_ROOT
+# Resolve PROJECT before srun changes cwd to the job's log directory.
+PROJECT=${PROJECT:-$DEPLOY_KIT_ROOT}
+[[ -d $PROJECT ]] || die "Project directory missing: $PROJECT"
+PROJECT=$(cd -- "$PROJECT" && pwd)
+export LAUNCHER NETWORK_SCRIPT DEPLOY_KIT_ROOT PROJECT
 
 run_dir=$JOB_WORK_DIR/vllm-run-$SLURM_JOB_ID
 mkdir -p -- "$run_dir"
@@ -111,7 +114,7 @@ export CONTEXT_PROFILE=${CONTEXT_PROFILE:-1m}
 export SPEC_METHOD=${SPEC_METHOD:-dflash}
 if [[ $SPEC_METHOD == dflash ]]; then
     export SPEC_TOKENS=${SPEC_TOKENS:-15}
-    export SPEC_MODEL=${SPEC_MODEL:-${PROJECT:-/opt/share/gits/Agentic/vllm}/models/Qwen3-Coder-Next-DFlash}
+    export SPEC_MODEL=${SPEC_MODEL:-$PROJECT/models/Qwen3-Coder-Next-DFlash}
 fi
 if [[ $SPEC_METHOD != none ]] && (( PP_SIZE != 1 )); then
     die 'The launcher speculative presets require PP_SIZE=1; use TP_SIZE=NUM_NODES.'

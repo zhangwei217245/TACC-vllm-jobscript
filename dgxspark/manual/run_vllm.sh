@@ -6,9 +6,11 @@ IFACE=enp1s0f1np1
 LOCAL_IP=$(ip -4 -o addr show dev ${IFACE} | head -n 1 | awk '{split($4,a,"/"); print a[1]}')
 HEAD_IP=192.168.1.1
 
-PROJECT=/opt/share/gits/Agentic/vllm
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+PROJECT=${PROJECT:-$(cd -- "$SCRIPT_DIR/../.." && pwd)}
+PROJECT=$(cd -- "$PROJECT" && pwd)
 
-source $PROJECT/.venv/bin/activate
+source "$PROJECT/.venv/bin/activate"
 
 cd "$PROJECT"
 
