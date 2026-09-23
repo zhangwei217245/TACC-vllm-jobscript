@@ -1,206 +1,475 @@
 #!/usr/bin/env bash
-# Run this launcher on each node; put inference-network.sh and hosts.txt beside it.
-# hosts.txt contains one hostname per line in the same order on every node.
-# Its first host is rank 0; subsequent hosts are ranks 1, 2, etc.
-# The network helper configures each node locally; it does not elect the head.
-# All nodes MUST share the host list, HEAD_IP, MASTER_PORT, TP_SIZE, PP_SIZE and
-# model settings. HEAD_IP must belong to the first listed host.
-# NODE_RANK and NUM_NODES are derived from the file. No remote processes launch.
-# Defaults: TP=GPUs/node, PP=number of hosts,
-# Qwen3-Coder-Next-FP8, 256K context, memory fraction 0.6, instanttensor.
-# These defaults do not certify model PP support or available cache capacity.
+# Per-node Qwen3-Coder-Next launcher. Bash >=4; NVIDIA CUDA; local vLLM venv.
+# Run on EVERY node. This script launches no remote processes and requests no allocation.
+# Keep inference-network.sh and the SAME ordered hosts.txt beside it on all nodes.
+# The helper configures local NICs; the first host in hosts.txt is the head.
+# All nodes need identical model weights/configuration and serving settings.
 #
-# Examples:
-#   bash ./launch-vllm.sh --dry-run
-#   scontrol show hostnames "$SLURM_JOB_NODELIST" > hosts.txt  # once per allocation
-#   HOSTFILE=/shared/job-hosts.txt bash ./launch-vllm.sh
-#   NET_TRANSPORT=socket MAX_MODEL_LEN=32768 bash ./launch-vllm.sh
-#   TP_SIZE=4 PP_SIZE=1 bash ./launch-vllm.sh
+# Defaults retained: PROJECT, local model path, HEAD_IP=192.168.1.1,
+# MASTER_PORT=8041, HTTP range 8040-8050, RDMA, instanttensor, memory fraction .75.
+# Defaults changed: TP spans all GPUs, PP=1; 1M context uses YaRN; max sequences=1.
+# 1M is experimental extension of the native 256K window, not a quality guarantee.
+# Use CONTEXT_PROFILE=128k or 256k for ordinary coding without RoPE scaling.
 #
-# --dry-run performs local network/port/GPU checks and prints the command;
-# it does not load weights or start vLLM. Checks do not reserve ports.
-set -euo pipefail
+# Examples (use the same overrides on every node):
+#   bash launch-vllm.sh --help
+#   bash launch-vllm.sh --dry-run
+#   CONTEXT_PROFILE=128k bash launch-vllm.sh
+#   CONTEXT_PROFILE=512k bash launch-vllm.sh
+#   CONTEXT_PROFILE=1m KV_CACHE_DTYPE=fp8 bash launch-vllm.sh
+#   NET_TRANSPORT=socket TP_SIZE=4 PP_SIZE=1 bash launch-vllm.sh
+#   CONTEXT_PROFILE=128k SPEC_METHOD=ngram bash launch-vllm.sh
+# Download a complete draft checkpoint once into shared storage (or on each node):
+#   hf download z-lab/Qwen3-Coder-Next-DFlash \
+#     --local-dir /opt/share/gits/Agentic/vllm/models/Qwen3-Coder-Next-DFlash
+# Downloading locally does not establish FP8/GB10 compatibility.
+# Use the same absolute directory on every node:
+#   CONTEXT_PROFILE=128k SPEC_METHOD=dflash \
+#     SPEC_MODEL=/opt/share/gits/Agentic/vllm/models/Qwen3-Coder-Next-DFlash \
+#     bash launch-vllm.sh
+#   export VLLM_API_KEY='private-key'  # optional; never printed by this launcher
+# Generate hosts.txt ONCE per Slurm allocation; distribute the same ordering:
+#   scontrol show hostnames "$SLURM_JOB_NODELIST" > hosts.txt
+#
+# Docs checked 2026-09-23 (no GPU validation of this launcher):
+# https://huggingface.co/Qwen/Qwen3-Coder-Next
+# https://docs.vllm.ai/en/v0.29.0/serving/parallelism_scaling/
+# https://docs.vllm.ai/en/latest/features/context_extension/
+# https://docs.vllm.ai/en/latest/features/speculative_decoding/
+# https://huggingface.co/z-lab/Qwen3-Coder-Next-DFlash
+# https://huggingface.co/togethercomputer/Aurora-Spec-Qwen3-Coder-Next-FP8
 
+set -euo pipefail
+(( BASH_VERSINFO[0] >= 4 )) || { printf 'Bash 4 or later is required.\n' >&2; exit 1; }
 die() { printf 'launch-vllm: %s\n' "$*" >&2; exit 1; }
+warn() { printf 'launch-vllm: %s\n' "$*" >&2; }
+positive_int() {
+    local name=$1 value=${!1}
+    [[ $value =~ ^[0-9]{1,9}$ ]] || die "$name must be a positive integer."
+    (( 10#$value > 0 )) || die "$name must be positive."
+    printf -v "$name" '%d' "$((10#$value))"
+}
+boolean() { [[ ${!1} == 0 || ${!1} == 1 ]] || die "$1 must be 0 or 1."; }
+
 dry_run=0
-case "${1:-}" in
-    --dry-run) dry_run=1; shift;;
+case ${1:-} in
+    --dry-run) dry_run=1; shift ;;
     -h|--help)
         cat <<'HELP'
 Usage: bash launch-vllm.sh [--dry-run]
+Run once on EACH node. No SSH, Ray cluster creation, or Slurm allocation is done.
+Dry-run runs local checks (including the network helper) and prints a redacted
+command. It loads no weights, starts no vLLM, and does not reserve ports.
 
-Configure via environment variables (defaults are in this script):
-  PROJECT, NETWORK_SCRIPT, HEAD_IP, MASTER_PORT
-  HOSTFILE (default: hosts.txt beside this launcher), LOCAL_NODE_NAME
-  MODEL_NAME, MODEL_REPO, MODEL_PATH, MAX_MODEL_LEN, GPU_MEM_UTILIZATION
-  MAX_NUM_SEQS, LOAD_FORMAT, TP_SIZE, PP_SIZE
-  NET_TRANSPORT=rdma|auto|socket, NET_DEBUG=1|0, NET_IFACE, NET_HCA
-  NET_LOCAL_IP, NET_USE_MASTER_ROUTE=1|0 (default 0: automatic local NIC ranking)
-  HTTP_PORTS (default 8040-8050), SERVICE_PORT (optional exact port override)
-  HTTP_IFACE, HTTP_CLIENT, HTTP_IP, HTTP_AUDIT=1|0
-  HTTP_RESERVED_PORTS (extra exclusions; MASTER_PORT is always excluded)
-  MOE_BACKEND (optional; passed on all nodes only when nonempty)
-  ENFORCE_EAGER=1|0 (default 0)
+Paths and membership:
+  PROJECT=/opt/share/gits/Agentic/vllm   (.venv/bin/python and vllm required)
+  NETWORK_SCRIPT=inference-network.sh HOSTFILE=hosts.txt (beside launcher)
+  LOCAL_NODE_NAME                     (optional override for Slurm aliases)
+  HEAD_IP=192.168.1.1 MASTER_PORT=8041 (same on all nodes; head owns HEAD_IP)
+  MODEL_NAME=Qwen3-Coder-Next-FP8 MODEL_REPO=$PROJECT/models MODEL_PATH=...
+  SERVED_MODEL_NAME=$MODEL_NAME       (preserves the original API model name)
 
-Only rank 0 uses HTTP detection. Workers get --headless and no HTTP options.
-The host file is required: one hostname per line, in identical order everywhere.
-Blank lines and full-line # comments are ignored. Short names and FQDNs match
-case-insensitively by their first label; these labels must be unique in the file.
-LOCAL_NODE_NAME overrides hostname -s for sites using Slurm node aliases.
-NODE_RANK and NUM_NODES come from the file; conflicting environment values fail.
-HEAD_IP remains shared configuration and must address the FIRST listed host.
-Homogeneous GPU counts assumed.
-HTTP bind availability does not prove firewall permission/client reachability.
+Context and performance:
+  CONTEXT_PROFILE=128k|256k|512k|1m    (default 1m; explicit MAX_MODEL_LEN wins)
+  MAX_MODEL_LEN                      (total input + output tokens)
+  MAX_NUM_SEQS                        (default 1 above native context, otherwise 4)
+  MAX_NUM_BATCHED_TOKENS              (default 4096 extended, otherwise 8192)
+  BATCH_TOKENS                        (fallback alias for the setting above)
+  GPU_MEM_UTILIZATION=0.75 DTYPE=auto KV_CACHE_DTYPE=auto LOAD_FORMAT=instanttensor
+  TP_SIZE                            (default total visible GPUs across nodes)
+  PP_SIZE=1                          (explicit PP must be supported by model/build)
+  PREFIX_CACHING=1 CHUNKED_PREFILL=1 ENFORCE_EAGER=0
+  ATTENTION_BACKEND MOE_BACKEND MAMBA_CACHE_MODE (optional; retain auto selection)
+  HF_OVERRIDES                       (optional JSON object, merged over auto YaRN)
+
+Tools, sampling, and API:
+  TOOL_CALL_PARSER=qwen3_coder ENABLE_AUTO_TOOL_CHOICE=1 PROMPT_TOKENS_DETAILS=1
+  TEMPERATURE=1.0 TOP_P=0.95 TOP_K=40 REPETITION_PENALTY=1.0
+  PRESENCE_PENALTY=0.0 FREQUENCY_PENALTY=0.0
+  VLLM_API_KEY                        (optional, passed only on head; redacted)
+  No reasoning parser: official Coder-Next is a non-thinking checkpoint.
+
+Speculative decoding (default off):
+  SPEC_METHOD=none|ngram|dflash|eagle3
+  SPEC_TOKENS                        (defaults: ngram=4, dflash=15, eagle3=3)
+  SPEC_MODEL                         (Hugging Face ID or absolute local draft directory)
+  NGRAM_MIN=2 NGRAM_MAX=5
+  DFlash: z-lab/Qwen3-Coder-Next-DFlash (author recipe: BF16 target, FlashAttention,
+    batch tokens 32768; FP8/GB10 combinations require validation).
+  EAGLE3: togethercomputer/Aurora-Spec-Qwen3-Coder-Next-FP8 (experimental in vLLM;
+    checkpoint author documents SGLang). Drafter context may be shorter than target.
+  MTP/DSpark are not presets: no matching native MTP/DSpark checkpoint verified.
+
+Existing network helper options (forwarded unchanged):
+  NET_TRANSPORT=rdma|auto|socket NET_DEBUG=1 NET_IFACE NET_HCA NET_LOCAL_IP
+  NET_USE_MASTER_ROUTE=0              (1 passes HEAD_IP to helper's --master)
+  HTTP_PORTS=8040-8050 SERVICE_PORT HTTP_IFACE HTTP_CLIENT HTTP_IP HTTP_AUDIT=0
+  HTTP_RESERVED_PORTS                 (MASTER_PORT always excluded)
+  Helper must EXPORT/set INFER_HTTP_HOST and INFER_HTTP_PORT on rank 0.
+
+hosts.txt accepts one expanded hostname per line; blank/comment lines ignored.
+Short labels must be unique (case-insensitive). NODE_RANK/NUM_NODES are derived;
+conflicting environment values fail. GPU count must be homogeneous across nodes.
+Compare the printed configuration fingerprints manually; no remote consistency
+check is performed. A free bind port does not prove external client reachability.
+Keep the endpoint private or behind a gateway: --api-key is not whole-server TLS
+or authorization. KV offloading is deliberately unset, including at 1M.
 HELP
-        exit 0;;
+    exit 0 ;;
 esac
-(( $# == 0 )) || die 'Unknown argument; use --help.'
+(( $# == 0 )) || die 'Unknown argument; use --help. Configure through environment variables.'
 
+# Resolve caller-relative paths before moving into the project directory.
 LAUNCH_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 PROJECT=${PROJECT:-/opt/share/gits/Agentic/vllm}
-[[ -d "$PROJECT" ]] || die "Project directory missing: $PROJECT"
+[[ -d $PROJECT ]] || die "Project directory missing: $PROJECT"
 PROJECT=$(cd -- "$PROJECT" && pwd)
 NETWORK_SCRIPT=${NETWORK_SCRIPT:-$LAUNCH_DIR/inference-network.sh}
-# Resolve a relative override before changing into the project directory.
-[[ "$NETWORK_SCRIPT" == /* ]] || NETWORK_SCRIPT="$PWD/$NETWORK_SCRIPT"
-HEAD_IP=${HEAD_IP:-192.168.1.1}
-MASTER_PORT=${MASTER_PORT:-8041}
+HOSTFILE=${HOSTFILE:-$LAUNCH_DIR/hosts.txt}
 MODEL_NAME=${MODEL_NAME:-Qwen3-Coder-Next-FP8}
 MODEL_REPO=${MODEL_REPO:-$PROJECT/models}
 MODEL_PATH=${MODEL_PATH:-$MODEL_REPO/$MODEL_NAME}
-[[ "$MODEL_PATH" == /* ]] || MODEL_PATH="$PWD/$MODEL_PATH"
-MAX_MODEL_LEN=${MAX_MODEL_LEN:-262144}
-GPU_MEM_UTILIZATION=${GPU_MEM_UTILIZATION:-0.6}
-MAX_NUM_SEQS=${MAX_NUM_SEQS:-8}
-LOAD_FORMAT=${LOAD_FORMAT:-instanttensor}
-NET_TRANSPORT=${NET_TRANSPORT:-rdma}
-HTTP_PORTS=${HTTP_PORTS:-8040-8050}
+for path_name in NETWORK_SCRIPT HOSTFILE MODEL_PATH; do
+    [[ ${!path_name} == /* ]] || printf -v "$path_name" '%s/%s' "$PWD" "${!path_name}"
+done
+SERVED_MODEL_NAME=${SERVED_MODEL_NAME:-$MODEL_NAME}
+HEAD_IP=${HEAD_IP:-192.168.1.1}
+MASTER_PORT=${MASTER_PORT:-8041}
+positive_int MASTER_PORT
+(( MASTER_PORT <= 65535 )) || die 'MASTER_PORT must be 1..65535.'
+[[ -r $HOSTFILE ]] || die "Host file missing or unreadable: $HOSTFILE"
 
-# The ordered host file is the authority for membership and rank on every run.
-HOSTFILE=${HOSTFILE:-$LAUNCH_DIR/hosts.txt}
-[[ "$HOSTFILE" == /* ]] || HOSTFILE="$PWD/$HOSTFILE"
-[[ -f "$HOSTFILE" && -r "$HOSTFILE" ]] || die "Host file missing or unreadable: $HOSTFILE"
+# Derive rank from file ordering, never from whichever NIC the helper selects.
 node_name=${LOCAL_NODE_NAME:-$(hostname -s)}
-local_key=${node_name,,}
-local_key=${local_key%%.*}
-[[ -n "$local_key" ]] || die 'Cannot determine the local hostname.'
+local_key=${node_name,,}; local_key=${local_key%%.*}
+[[ -n $local_key ]] || die 'Cannot determine the local hostname.'
 declare -a NODES=()
 declare -A seen_hosts=()
 detected_rank=-1
 line_number=0
-while IFS= read -r host_line || [[ -n "$host_line" ]]; do
+while IFS= read -r host_line || [[ -n $host_line ]]; do
     line_number=$((line_number + 1))
     host_line=${host_line%$'\r'}
-    # read trims surrounding spaces/tabs; additional columns are not permitted.
-    read -r host_entry extra <<< "$host_line"
-    [[ -n "$host_entry" && "$host_entry" != \#* ]] || continue
-    [[ -z "$extra" && "$host_entry" =~ ^[[:alnum:]_][[:alnum:]_.-]*$ ]] ||
-        die "Invalid host at $HOSTFILE:$line_number; use one expanded hostname per line."
-    host_key=${host_entry,,}
-    host_key=${host_key%%.*}
-    [[ -z "${seen_hosts[$host_key]+present}" ]] ||
-        die "Duplicate or ambiguous short hostname '$host_key' in $HOSTFILE."
+    host_entry=; extra=
+    read -r host_entry extra <<< "$host_line" || true
+    [[ -n $host_entry && $host_entry != \#* ]] || continue
+    [[ -z $extra && $host_entry =~ ^[[:alnum:]_][[:alnum:]_.-]*$ ]] ||
+    die "Invalid host at $HOSTFILE:$line_number; one expanded hostname per line required."
+    host_key=${host_entry,,}; host_key=${host_key%%.*}
+    [[ -z ${seen_hosts[$host_key]+present} ]] || die "Duplicate short hostname '$host_key'."
     seen_hosts[$host_key]=1
-    [[ "$host_key" != "$local_key" ]] || detected_rank=${#NODES[@]}
+    [[ $host_key != "$local_key" ]] || detected_rank=${#NODES[@]}
     NODES+=("$host_entry")
 done < "$HOSTFILE"
-(( ${#NODES[@]} > 0 )) || die "Host file is empty: $HOSTFILE"
-(( detected_rank >= 0 )) || die "Local host '$node_name' is absent from $HOSTFILE; use LOCAL_NODE_NAME for a Slurm alias."
-# Retained environment values may confirm the file, but cannot override it.
+(( ${#NODES[@]} > 0 )) || die 'Host file is empty.'
+(( detected_rank >= 0 )) || die "Local host '$node_name' absent from host file; check LOCAL_NODE_NAME."
 for derived_name in NODE_RANK NUM_NODES; do
     supplied_value=${!derived_name-}
     expected_value=$detected_rank
-    [[ "$derived_name" != NUM_NODES ]] || expected_value=${#NODES[@]}
-    if [[ -n "$supplied_value" ]]; then
-        [[ "$supplied_value" =~ ^[0-9]{1,6}$ ]] || die "$derived_name must be an integer."
-        (( 10#$supplied_value == expected_value )) || die "$derived_name=$supplied_value conflicts with host file value $expected_value."
+    [[ $derived_name != NUM_NODES ]] || expected_value=${#NODES[@]}
+    if [[ -n $supplied_value ]]; then
+        [[ $supplied_value =~ ^[0-9]{1,6}$ ]] || die "$derived_name must be an integer."
+        (( 10#$supplied_value == expected_value )) ||
+        die "$derived_name=$supplied_value conflicts with host file value $expected_value."
     fi
 done
 NODE_RANK=$detected_rank
 NUM_NODES=${#NODES[@]}
 HEAD_NODE=${NODES[0]}
-printf 'Host file: %s; local=%s; NODE_RANK=%s; NUM_NODES=%s; HEAD_NODE=%s\n' \
-    "$HOSTFILE" "$node_name" "$NODE_RANK" "$NUM_NODES" "$HEAD_NODE" >&2
-[[ "$MASTER_PORT" =~ ^[0-9]{1,5}$ ]] || die 'MASTER_PORT must be an integer.'
-MASTER_PORT=$((10#$MASTER_PORT))
-(( MASTER_PORT >= 1 && MASTER_PORT <= 65535 )) || die 'MASTER_PORT must be 1..65535.'
 
-[[ -r "$NETWORK_SCRIPT" ]] || die "Network helper missing: $NETWORK_SCRIPT"
-[[ -r "$PROJECT/.venv/bin/activate" ]] || die "Virtual environment missing: $PROJECT/.venv"
-[[ -x "$PROJECT/.venv/bin/vllm" && -x "$PROJECT/.venv/bin/python" ]] || die 'vLLM/Python executable missing from the virtual environment.'
-[[ -d "$MODEL_PATH" ]] || die "Local model directory missing: $MODEL_PATH"
+[[ -r $NETWORK_SCRIPT ]] || die "Network helper missing: $NETWORK_SCRIPT"
+[[ -r $PROJECT/.venv/bin/activate ]] || die "Virtual environment missing: $PROJECT/.venv"
+PYTHON=$PROJECT/.venv/bin/python
+VLLM=$PROJECT/.venv/bin/vllm
+[[ -x $PYTHON && -x $VLLM ]] || die 'vLLM/Python executable missing from virtual environment.'
+[[ -r $MODEL_PATH/config.json ]] || die "Model config missing: $MODEL_PATH/config.json"
 source "$PROJECT/.venv/bin/activate"
 cd -- "$PROJECT"
+NUM_GPUS=$("$PYTHON" -c 'import torch; print(torch.cuda.device_count())')
+positive_int NUM_GPUS
+TP_SIZE=${TP_SIZE:-$((NUM_NODES * NUM_GPUS))}
+PP_SIZE=${PP_SIZE:-1}
+positive_int TP_SIZE
+positive_int PP_SIZE
+(( TP_SIZE * PP_SIZE == NUM_NODES * NUM_GPUS )) ||
+die 'TP_SIZE * PP_SIZE must equal NUM_NODES * visible GPUs/node.'
 
-# Count GPUs visible to this Python process, respecting CUDA_VISIBLE_DEVICES.
-NUM_GPUS=$("$PROJECT/.venv/bin/python" -c 'import torch; print(torch.cuda.device_count())')
-[[ "$NUM_GPUS" =~ ^[1-9][0-9]*$ ]] || die 'No visible CUDA GPUs.'
-TP_SIZE=${TP_SIZE:-$NUM_GPUS}
-PP_SIZE=${PP_SIZE:-$NUM_NODES}
-[[ "$TP_SIZE" =~ ^[0-9]{1,6}$ && "$PP_SIZE" =~ ^[0-9]{1,6}$ ]] || die 'TP_SIZE and PP_SIZE must be positive integers.'
-TP_SIZE=$((10#$TP_SIZE)); PP_SIZE=$((10#$PP_SIZE))
-(( TP_SIZE > 0 && PP_SIZE > 0 && TP_SIZE * PP_SIZE == NUM_NODES * NUM_GPUS )) ||
-    die 'TP_SIZE * PP_SIZE must equal NUM_NODES * visible GPUs/node for this homogeneous launcher.'
+# Explicit MAX_MODEL_LEN overrides the preset. Auto YaRN is based on this final length.
+CONTEXT_PROFILE=${CONTEXT_PROFILE:-1m}
+case ${CONTEXT_PROFILE,,} in
+    128k) profile_len=131072 ;;
+    256k) profile_len=262144 ;;
+    512k) profile_len=524288 ;;
+    1m) profile_len=1048576 ;;
+    *) die 'CONTEXT_PROFILE must be 128k, 256k, 512k, or 1m.' ;;
+esac
+MAX_MODEL_LEN=${MAX_MODEL_LEN:-$profile_len}
+positive_int MAX_MODEL_LEN
+GPU_MEM_UTILIZATION=${GPU_MEM_UTILIZATION:-0.75}
+DTYPE=${DTYPE:-auto}
+KV_CACHE_DTYPE=${KV_CACHE_DTYPE:-auto}
+LOAD_FORMAT=${LOAD_FORMAT:-instanttensor}
+PREFIX_CACHING=${PREFIX_CACHING:-1}
+CHUNKED_PREFILL=${CHUNKED_PREFILL:-1}
+ENFORCE_EAGER=${ENFORCE_EAGER:-0}
+ENABLE_AUTO_TOOL_CHOICE=${ENABLE_AUTO_TOOL_CHOICE:-1}
+PROMPT_TOKENS_DETAILS=${PROMPT_TOKENS_DETAILS:-1}
+TOOL_CALL_PARSER=${TOOL_CALL_PARSER:-qwen3_coder}
+NET_TRANSPORT=${NET_TRANSPORT:-rdma}
+NET_DEBUG=${NET_DEBUG:-1}
+NET_USE_MASTER_ROUTE=${NET_USE_MASTER_ROUTE:-0}
+HTTP_AUDIT=${HTTP_AUDIT:-0}
+HTTP_PORTS=${HTTP_PORTS:-8040-8050}
+for name in PREFIX_CACHING CHUNKED_PREFILL ENFORCE_EAGER ENABLE_AUTO_TOOL_CHOICE \
+PROMPT_TOKENS_DETAILS NET_DEBUG NET_USE_MASTER_ROUTE HTTP_AUDIT; do boolean "$name"; done
+case $NET_TRANSPORT in rdma|auto|socket) ;; *) die 'Invalid NET_TRANSPORT.' ;; esac
 
+# Build JSON with Python, not shell interpolation/eval. Preserve checkpoint RoPE values.
+# User HF_OVERRIDES recursively overrides auto settings; it must be a JSON object.
+config_output=$("$PYTHON" - "$MODEL_PATH/config.json" "$MAX_MODEL_LEN" "${HF_OVERRIDES:-}" \
+"$GPU_MEM_UTILIZATION" "${TEMPERATURE:-1.0}" "${TOP_P:-0.95}" "${TOP_K:-40}" \
+    "${REPETITION_PENALTY:-1.0}" "${PRESENCE_PENALTY:-0.0}" "${FREQUENCY_PENALTY:-0.0}" <<'PY'
+import hashlib, json, math, sys
+try:
+    path, length, overrides, mem, temp, top_p, top_k, rep, pres, freq = sys.argv[1:]
+    with open(path) as f:
+        model = json.load(f)
+    native = int(model['max_position_embeddings'])
+    length = int(length)
+    if native <= 0:
+        raise ValueError('native context must be positive')
+    mem, temp, top_p, rep, pres, freq = map(float, (mem, temp, top_p, rep, pres, freq))
+    top_k = int(top_k)
+    if not all(math.isfinite(v) for v in (mem, temp, top_p, rep, pres, freq)):
+        raise ValueError('numeric settings must be finite')
+    if not (0 < mem <= 1 and temp >= 0 and 0 < top_p <= 1 and rep > 0):
+        raise ValueError('invalid memory utilization or sampling range')
+    if top_k != -1 and top_k < 1:
+        raise ValueError('TOP_K must be -1 or positive')
+    if not (-2 <= pres <= 2 and -2 <= freq <= 2):
+        raise ValueError('presence/frequency penalties must be within [-2, 2]')
+    user = json.loads(overrides) if overrides else {}
+    if not isinstance(user, dict):
+        raise ValueError('HF_OVERRIDES must be a JSON object')
+    hf = {}
+    if length > native:
+        if model.get('model_type') != 'qwen3_next':
+            raise ValueError('automatic YaRN is specific to qwen3_next; use an appropriate model launcher')
+        rope = model.get('rope_scaling') or model.get('rope_parameters') or {}
+        if rope.get('rope_type', rope.get('type', 'default')) != 'default':
+            raise ValueError('checkpoint already scales RoPE; avoid automatically scaling it a second time')
+        hf = {'rope_parameters': {
+            'rope_type': 'yarn', 'factor': length / native,
+            'original_max_position_embeddings': native,
+            'rope_theta': rope.get('rope_theta', model.get('rope_theta', 5000000.0)),
+            'partial_rotary_factor': rope.get('partial_rotary_factor', model.get('partial_rotary_factor', 0.25)),
+        }}
+    def merge(dst, src):
+        for k, v in src.items():
+            if isinstance(v, dict) and isinstance(dst.get(k), dict):
+                merge(dst[k], v)
+            else:
+                dst[k] = v
+    merge(hf, user)
+    sampling = dict(temperature=temp, top_p=top_p, top_k=top_k,
+                    repetition_penalty=rep, presence_penalty=pres, frequency_penalty=freq)
+    print(native)
+    print(json.dumps(hf, separators=(',', ':'), allow_nan=False))
+    print(json.dumps(sampling, separators=(',', ':'), allow_nan=False))
+    print(hashlib.sha256(json.dumps(model, sort_keys=True).encode()).hexdigest())
+except (ValueError, KeyError, TypeError, OSError) as exc:
+    sys.exit(f'Configuration error: {exc}')
+PY
+) || die 'Model/context/sampling validation failed.'
+mapfile -t config_lines <<< "$config_output"
+NATIVE_CONTEXT=${config_lines[0]}
+HF_CONFIG=${config_lines[1]}
+GENERATION_CONFIG=${config_lines[2]}
+MODEL_CONFIG_SHA=${config_lines[3]}
+if (( MAX_MODEL_LEN > NATIVE_CONTEXT )); then
+    default_seqs=1; default_batch=4096
+    warn "Extended context $MAX_MODEL_LEN > native $NATIVE_CONTEXT: validate quality and memory."
+else
+    default_seqs=4; default_batch=8192
+fi
+MAX_NUM_SEQS=${MAX_NUM_SEQS:-$default_seqs}
+MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS:-${BATCH_TOKENS:-$default_batch}}
+positive_int MAX_NUM_SEQS
+positive_int MAX_NUM_BATCHED_TOKENS
+(( MAX_NUM_BATCHED_TOKENS >= MAX_NUM_SEQS )) || die 'Batch-token budget must cover MAX_NUM_SEQS.'
+if (( ! CHUNKED_PREFILL && MAX_NUM_BATCHED_TOKENS < MAX_MODEL_LEN )); then
+    die 'Without chunked prefill, batch-token budget must cover MAX_MODEL_LEN.'
+fi
+
+# Exactly one speculative method. Native MTP/DSpark support is not assumed.
+SPEC_METHOD=${SPEC_METHOD:-none}
+SPEC_CONFIG=
+case $SPEC_METHOD in
+    none) [[ -z ${SPEC_MODEL:-} && -z ${SPEC_TOKENS:-} ]] || die 'SPEC_MODEL/TOKENS require a speculative method.' ;;
+    ngram|dflash|eagle3)
+        (( PP_SIZE == 1 )) || die 'This speculative preset requires PP_SIZE=1.'
+        case $SPEC_METHOD in
+            ngram)
+                [[ -z ${SPEC_MODEL:-} ]] || die 'N-gram drafting does not use SPEC_MODEL.'
+                SPEC_TOKENS=${SPEC_TOKENS:-4}; SPEC_MODEL= ;;
+            dflash)
+                SPEC_TOKENS=${SPEC_TOKENS:-15}
+                SPEC_MODEL=${SPEC_MODEL:-z-lab/Qwen3-Coder-Next-DFlash}
+                warn 'DFlash preset is experimental on FP8/GB10; verify drafter/backend compatibility.' ;;
+            eagle3)
+                SPEC_TOKENS=${SPEC_TOKENS:-3}
+                SPEC_MODEL=${SPEC_MODEL:-togethercomputer/Aurora-Spec-Qwen3-Coder-Next-FP8}
+                warn 'Aurora EAGLE3 author documents SGLang; validate this vLLM combination.' ;;
+        esac
+        positive_int SPEC_TOKENS
+        NGRAM_MIN=${NGRAM_MIN:-2}; NGRAM_MAX=${NGRAM_MAX:-5}
+        positive_int NGRAM_MIN; positive_int NGRAM_MAX
+        (( NGRAM_MIN <= NGRAM_MAX )) || die 'NGRAM_MIN must not exceed NGRAM_MAX.'
+        SPEC_CONFIG=$("$PYTHON" - "$SPEC_METHOD" "$SPEC_TOKENS" "$SPEC_MODEL" "$NGRAM_MIN" "$NGRAM_MAX" <<'PY'
+import json, sys
+method, tokens, model, low, high = sys.argv[1:]
+config = dict(method=method, num_speculative_tokens=int(tokens))
+if method == 'ngram':
+    config.update(prompt_lookup_min=int(low), prompt_lookup_max=int(high))
+else:
+    config['model'] = model
+print(json.dumps(config, separators=(',', ':')))
+PY
+        )
+        if [[ $SPEC_METHOD != ngram ]] && (( MAX_MODEL_LEN > NATIVE_CONTEXT )); then
+            warn 'Target YaRN does not extend the drafter; establish a non-speculative long-context baseline first.'
+        fi ;;
+    *) die 'SPEC_METHOD must be none, ngram, dflash, or eagle3.' ;;
+esac
+
+# Same engine arguments on all ranks. Frontend-only options are added on rank 0.
+engine_args=(
+    --tensor-parallel-size "$TP_SIZE"             # Total ranks sharding tensors.
+    --pipeline-parallel-size "$PP_SIZE"           # Pipeline stages (default 1).
+    --distributed-executor-backend mp             # Per-node multiprocessing, no Ray.
+    --nnodes "$NUM_NODES"                        # Number of participating hosts.
+    --master-addr "$HEAD_IP"                      # Shared rendezvous address, owned by head.
+    --master-port "$MASTER_PORT"                  # Shared rendezvous TCP port, not HTTP.
+    --dtype "$DTYPE"                             # Compute/unquantized dtype; retains FP8 weights.
+    --max-model-len "$MAX_MODEL_LEN"              # Total input plus output tokens per request.
+    --gpu-memory-utilization "$GPU_MEM_UTILIZATION" # Per-GPU executor memory budget fraction.
+    --max-num-seqs "$MAX_NUM_SEQS"                # Maximum scheduled sequences; others may queue.
+    --max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS" # Per-step token budget, not context size.
+    --kv-cache-dtype "$KV_CACHE_DTYPE"            # Attention KV precision, separate from weights.
+    --load-format "$LOAD_FORMAT"                 # Weight loader; affects startup, not context.
+    --generation-config vllm                     # Use explicit sampling defaults below.
+    --override-generation-config "$GENERATION_CONFIG" # Request values may override defaults.
+)
+if (( PREFIX_CACHING )); then
+    engine_args+=(--enable-prefix-caching)        # Reuse matching prefixes between agent turns.
+else
+    engine_args+=(--no-enable-prefix-caching)
+fi
+if (( CHUNKED_PREFILL )); then
+    engine_args+=(--enable-chunked-prefill)       # Split long prompt processing into chunks.
+else
+    engine_args+=(--no-enable-chunked-prefill)
+fi
+[[ $HF_CONFIG == '{}' ]] || engine_args+=(--hf-overrides "$HF_CONFIG") # APPLY YaRN on every rank.
+[[ -z $SPEC_CONFIG ]] || engine_args+=(--speculative-config "$SPEC_CONFIG") # Draft/verify tokens.
+[[ -z ${ATTENTION_BACKEND:-} ]] || engine_args+=(--attention-backend "$ATTENTION_BACKEND") # Attention kernel.
+[[ -z ${MOE_BACKEND:-} ]] || engine_args+=(--moe-backend "$MOE_BACKEND") # MoE kernel selection.
+[[ -z ${MAMBA_CACHE_MODE:-} ]] || engine_args+=(--mamba-cache-mode "$MAMBA_CACHE_MODE") # Recurrent cache policy.
+(( ! ENFORCE_EAGER )) || engine_args+=(--enforce-eager) # Debug fallback: disable graph execution.
+
+# Fingerprint excludes node rank, local model path, NIC, HTTP bind, and API key.
+# It includes config.json contents, NOT the full weight files or runtime versions.
+fingerprint=$("$PYTHON" - "$MODEL_CONFIG_SHA" "$TOOL_CALL_PARSER" "$SERVED_MODEL_NAME" \
+    "$ENABLE_AUTO_TOOL_CHOICE" "$NET_TRANSPORT" "${NODES[@]}" -- "${engine_args[@]}" <<'PY'
+import hashlib, json, sys
+print(hashlib.sha256(json.dumps(sys.argv[1:], separators=(',', ':')).encode()).hexdigest()[:16])
+PY
+)
+printf 'Host file: %s; local=%s; head=%s; rank=%s/%s; GPUs/node=%s; TP=%s PP=%s\n' \
+    "$HOSTFILE" "$node_name" "$HEAD_NODE" "$NODE_RANK" "$NUM_NODES" "$NUM_GPUS" "$TP_SIZE" "$PP_SIZE" >&2
+printf 'Context=%s native=%s; sequences=%s; batch tokens=%s; speculation=%s; config fingerprint=%s\n' \
+    "$MAX_MODEL_LEN" "$NATIVE_CONTEXT" "$MAX_NUM_SEQS" "$MAX_NUM_BATCHED_TOKENS" "$SPEC_METHOD" "$fingerprint" >&2
+
+# Preserve the original helper interface. Workers never request HTTP discovery.
 network_args=(--transport "$NET_TRANSPORT")
-[[ "${NET_DEBUG:-1}" != 1 ]] || network_args+=(--debug)
-[[ -z "${NET_IFACE:-}" ]] || network_args+=(--iface "$NET_IFACE")
-[[ -z "${NET_HCA:-}" ]] || network_args+=(--hca "$NET_HCA")
-[[ -z "${NET_LOCAL_IP:-}" ]] || network_args+=(--local-ip "$NET_LOCAL_IP")
-[[ "${NET_USE_MASTER_ROUTE:-0}" != 1 ]] || network_args+=(--master "$HEAD_IP")
+(( ! NET_DEBUG )) || network_args+=(--debug)
+[[ -z ${NET_IFACE:-} ]] || network_args+=(--iface "$NET_IFACE")
+[[ -z ${NET_HCA:-} ]] || network_args+=(--hca "$NET_HCA")
+[[ -z ${NET_LOCAL_IP:-} ]] || network_args+=(--local-ip "$NET_LOCAL_IP")
+(( ! NET_USE_MASTER_ROUTE )) || network_args+=(--master "$HEAD_IP")
 if (( NODE_RANK == 0 )); then
     network_args+=(--http --http-reserved-ports "$MASTER_PORT${HTTP_RESERVED_PORTS:+,$HTTP_RESERVED_PORTS}")
-    if [[ -n "${SERVICE_PORT:-}" ]]; then
+    if [[ -n ${SERVICE_PORT:-} ]]; then
+        positive_int SERVICE_PORT
+        (( SERVICE_PORT <= 65535 && SERVICE_PORT != MASTER_PORT )) || die 'Invalid/conflicting SERVICE_PORT.'
         network_args+=(--http-port "$SERVICE_PORT")
     else
         network_args+=(--http-ports "$HTTP_PORTS")
     fi
-    [[ -z "${HTTP_IFACE:-}" ]] || network_args+=(--http-iface "$HTTP_IFACE")
-    [[ -z "${HTTP_CLIENT:-}" ]] || network_args+=(--http-client "$HTTP_CLIENT")
-    [[ -z "${HTTP_IP:-}" ]] || network_args+=(--http-ip "$HTTP_IP")
-    [[ "${HTTP_AUDIT:-0}" != 1 ]] || network_args+=(--http-audit)
+    [[ -z ${HTTP_IFACE:-} ]] || network_args+=(--http-iface "$HTTP_IFACE")
+    [[ -z ${HTTP_CLIENT:-} ]] || network_args+=(--http-client "$HTTP_CLIENT")
+    [[ -z ${HTTP_IP:-} ]] || network_args+=(--http-ip "$HTTP_IP")
+    (( ! HTTP_AUDIT )) || network_args+=(--http-audit)
 fi
-source "$NETWORK_SCRIPT" "${network_args[@]}" || die 'Network configuration failed; vLLM was not launched.'
+source "$NETWORK_SCRIPT" "${network_args[@]}" || die 'Network helper failed; vLLM was not launched.'
 
+# Bind checks are local snapshots, not reservations or firewall/reachability tests.
 if (( NODE_RANK == 0 )); then
-    # Ensure HEAD_IP is assigned locally and catch stale listeners before loading
-    # weights. A wildcard bind also detects conflicts on another local address.
-    "$PROJECT/.venv/bin/python" - "$HEAD_IP" "$MASTER_PORT" <<'PY'
+    [[ -n ${INFER_HTTP_HOST:-} && -n ${INFER_HTTP_PORT:-} ]] || die 'Helper did not provide HTTP host/port.'
+    positive_int INFER_HTTP_PORT
+    (( INFER_HTTP_PORT <= 65535 && INFER_HTTP_PORT != MASTER_PORT )) || die 'Invalid/conflicting HTTP port.'
+    "$PYTHON" - "$HEAD_IP" "$MASTER_PORT" "$INFER_HTTP_HOST" "$INFER_HTTP_PORT" <<'PY'
 import ipaddress, socket, sys
 try:
-    address = ipaddress.IPv4Address(sys.argv[1])
-    if address.is_unspecified or address.is_loopback or address.is_multicast:
-        raise ValueError('HEAD_IP must be a peer-reachable unicast IPv4 address')
-    for host in (str(address), '0.0.0.0'):
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.bind((host, int(sys.argv[2])))
-except (OSError, ValueError) as exc:
-    sys.exit(f'Rendezvous preflight failed: {exc}')
+    head = ipaddress.IPv4Address(sys.argv[1])
+    if head.is_unspecified or head.is_loopback or head.is_multicast:
+        raise ValueError('HEAD_IP must be a peer-reachable unicast IPv4 address owned by the head')
+    bindings = [(str(head), int(sys.argv[2])), ('0.0.0.0', int(sys.argv[2])),
+                (sys.argv[3], int(sys.argv[4]))]
+    for host, port in bindings:
+        family = socket.AF_INET6 if ':' in host else socket.AF_INET
+        with socket.socket(family, socket.SOCK_STREAM) as sock:
+            sock.bind((host, port))
+except (ValueError, OSError) as exc:
+    sys.exit(f'Port/address preflight failed: {exc}')
 PY
 fi
 
-vllm_args=(serve "$MODEL_PATH"
-    --tensor-parallel-size "$TP_SIZE" --pipeline-parallel-size "$PP_SIZE"
-    --distributed-executor-backend mp --nnodes "$NUM_NODES" --node-rank "$NODE_RANK"
-    --master-addr "$HEAD_IP" --master-port "$MASTER_PORT"
-    --max-model-len "$MAX_MODEL_LEN" --gpu-memory-utilization "$GPU_MEM_UTILIZATION"
-    --max-num-seqs "$MAX_NUM_SEQS" --load-format "$LOAD_FORMAT" --enable-prefix-caching)
-[[ -z "${MOE_BACKEND:-}" ]] || vllm_args+=(--moe-backend "$MOE_BACKEND")
-[[ "${ENFORCE_EAGER:-0}" != 1 ]] || vllm_args+=(--enforce-eager)
+vllm_args=(serve "$MODEL_PATH" "${engine_args[@]}" --node-rank "$NODE_RANK") # This node's rank.
 if (( NODE_RANK == 0 )); then
-    [[ "$INFER_HTTP_PORT" != "$MASTER_PORT" ]] || die 'HTTP and rendezvous ports must differ.'
-    vllm_args+=(--served-model-name "$MODEL_NAME"
-        --host "$INFER_HTTP_HOST" --port "$INFER_HTTP_PORT"
-        --enable-auto-tool-choice --tool-call-parser qwen3_coder)
-    printf 'HTTP candidate endpoint: %s (external reachability unverified)\n' "$INFER_HTTP_URL" >&2
+    vllm_args+=(
+        --served-model-name "$SERVED_MODEL_NAME"   # API name; same in each coding client.
+        --host "$INFER_HTTP_HOST"                 # Bind address chosen by network helper.
+        --port "$INFER_HTTP_PORT"                 # HTTP API port; distinct from rendezvous.
+        --tool-call-parser "$TOOL_CALL_PARSER"     # Parse Qwen Coder tool syntax into API calls.
+    )
+    (( ! ENABLE_AUTO_TOOL_CHOICE )) || vllm_args+=(--enable-auto-tool-choice) # Model chooses tools.
+    (( ! PROMPT_TOKENS_DETAILS )) || vllm_args+=(--enable-prompt-tokens-details) # Cache usage reporting.
+    [[ -z ${VLLM_API_KEY:-} ]] || vllm_args+=(--api-key "$VLLM_API_KEY") # Auth on supported API routes.
+    endpoint=${INFER_HTTP_URL:-http://$INFER_HTTP_HOST:$INFER_HTTP_PORT}
+    printf 'HTTP candidate: %s (external reachability unverified); model=%s\n' "$endpoint" "$SERVED_MODEL_NAME" >&2
+    printf 'Set client context to %s including output; update its compaction threshold too.\n' "$MAX_MODEL_LEN" >&2
 else
-    vllm_args+=(--headless)
+    vllm_args+=(--headless)                       # Worker engine only, no HTTP frontend.
 fi
-printf 'Node %s: rank=%s/%s, TP=%s PP=%s, rendezvous=%s:%s\n' \
-    "$node_name" "$NODE_RANK" "$NUM_NODES" "$TP_SIZE" "$PP_SIZE" "$HEAD_IP" "$MASTER_PORT" >&2
-printf 'Command: ' >&2
-printf '%q ' "$PROJECT/.venv/bin/vllm" "${vllm_args[@]}" >&2
+
+# Do not enable shell tracing: the real command includes the optional API key.
+printf 'Command: %q ' "$VLLM" >&2
+redact_next=0
+for arg in "${vllm_args[@]}"; do
+    if (( redact_next )); then
+        printf '%q ' '<redacted>' >&2; redact_next=0
+    else
+        printf '%q ' "$arg" >&2
+        [[ $arg != --api-key ]] || redact_next=1
+    fi
+done
 printf '\n' >&2
 (( ! dry_run )) || exit 0
-exec "$PROJECT/.venv/bin/vllm" "${vllm_args[@]}"
+exec "$VLLM" "${vllm_args[@]}"
 
+# Deliberately absent: reasoning parser, enable_thinking override, custom chat
+# template, trust-remote-code, forced weight quantization, CPU/NVMe KV offloading,
+# expert-parallel toggle, and hybrid-cache-manager disablement. These are not
+# prerequisites for the official Coder-Next baseline. Prefix caching is not KV
+# offloading. Chunked prefill does not make an oversized active cache fit.

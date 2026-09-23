@@ -30,7 +30,7 @@ export NETWORK_SCRIPT=${NETWORK_SCRIPT:-$SLURM_SUBMIT_DIR/inference-network.sh}
 [[ "$NETWORK_SCRIPT" == /* ]] || NETWORK_SCRIPT="$PWD/$NETWORK_SCRIPT"
 [[ -r "$LAUNCHER" && -r "$NETWORK_SCRIPT" ]] || die 'Launcher or network helper missing.'
 
-run_dir="$SLURM_SUBMIT_DIR/vllm-$SLURM_JOB_ID"
+run_dir="$SLURM_SUBMIT_DIR/logs/vllm-run-$SLURM_JOB_ID"
 mkdir -p -- "$run_dir"
 export HOSTFILE="$run_dir/hosts.txt"
 scontrol show hostnames "$SLURM_JOB_NODELIST" > "$HOSTFILE"
@@ -70,6 +70,13 @@ printf 'Job %s: head=%s address=%s:%s TP=%s PP=%s\n' \
     "$SLURM_JOB_ID" "$head_node" "$HEAD_IP" "$MASTER_PORT" "$TP_SIZE" "$PP_SIZE"
 printf 'Host file: %s\nPer-node logs: %s/node-<hostname>.log\n' "$HOSTFILE" "$run_dir"
 cat -- "$HOSTFILE"
+
+
+export MAX_NUM_SEQS=8
+export CONTEXT_PROFILE='1m'  # 1m tokens
+export SPEC_METHOD=dflash
+export SPEC_TOKENS=15
+export SPEC_MODEL=/opt/share/gits/Agentic/vllm/models/Qwen3-Coder-Next-DFlash
 
 # Slurm launches one supervisor per node. vLLM starts its GPU workers itself;
 # Open MPI is not used. A task failure terminates the other tasks in this step.
