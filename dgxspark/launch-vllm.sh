@@ -81,6 +81,7 @@ Paths and membership:
 Context and performance:
   CONTEXT_PROFILE=128k|256k|512k|1m    (default 1m; explicit MAX_MODEL_LEN wins)
   MAX_MODEL_LEN                      (total input + output tokens)
+  VLLM_ALLOW_LONG_MAX_MODEL_LEN        (defaults to 1 above native context, with YaRN)
   MAX_NUM_SEQS                        (default 1 above native context, otherwise 4)
   MAX_NUM_BATCHED_TOKENS              (default 4096 extended, otherwise 8192)
   BATCH_TOKENS                        (fallback alias for the setting above)
@@ -223,8 +224,10 @@ cd -- "$PROJECT"
 # Validate optional frontend before CUDA/model startup. Workers have no HTTP app.
 if (( NODE_RANK == 0 && VLLM_UI_ENABLE )); then
     [[ -r $VLLM_MIDDLEWARE_DIR/static_ui.py ]] || die "Middleware missing: $VLLM_MIDDLEWARE_DIR/static_ui.py"
-    export VLLM_UI_DIR VLLM_UI_PAGE VLLM_PUBLIC_BASE_URL
-    export VLLM_UI_MODEL=$SERVED_MODEL_NAME  # Public model ID, never the API key.
+    # Keep project-owned settings out of vLLM's reserved VLLM_* namespace.
+    export TACC_UI_DIR=$VLLM_UI_DIR TACC_UI_PAGE=$VLLM_UI_PAGE
+    export TACC_PUBLIC_BASE_URL=$VLLM_PUBLIC_BASE_URL
+    export TACC_UI_MODEL=$SERVED_MODEL_NAME  # Public model ID, never the API key.
     # Import static_ui from the dedicated middleware directory; no __init__.py needed.
     export PYTHONPATH="$VLLM_MIDDLEWARE_DIR${PYTHONPATH:+:$PYTHONPATH}"
     "$PYTHON" - "$VLLM_MIDDLEWARE_DIR/static_ui.py" <<'PY'
@@ -235,6 +238,9 @@ if pathlib.Path(static_ui.__file__).resolve() != pathlib.Path(sys.argv[1]).resol
 static_ui.StaticUIMiddleware(app=None)  # Checks dependencies and static directory.
 PY
 fi
+# Retain legacy launcher inputs as shell variables, but do not send them to vLLM.
+export -n VLLM_UI_ENABLE VLLM_UI_MODEL VLLM_UI_DIR VLLM_UI_PAGE \
+    VLLM_PUBLIC_BASE_URL VLLM_MIDDLEWARE_DIR
 NUM_GPUS=$("$PYTHON" -c 'import torch; print(torch.cuda.device_count())')
 positive_int NUM_GPUS
 TP_SIZE=${TP_SIZE:-$((NUM_NODES * NUM_GPUS))}
@@ -337,6 +343,10 @@ HF_CONFIG=${config_lines[1]}
 GENERATION_CONFIG=${config_lines[2]}
 MODEL_CONFIG_SHA=${config_lines[3]}
 if (( MAX_MODEL_LEN > NATIVE_CONTEXT )); then
+    # Some vLLM/config versions still enforce the native limit with YaRN overrides.
+    # This permits the requested length; it does not implement RoPE scaling itself.
+    export VLLM_ALLOW_LONG_MAX_MODEL_LEN=${VLLM_ALLOW_LONG_MAX_MODEL_LEN:-1}
+    boolean VLLM_ALLOW_LONG_MAX_MODEL_LEN
     default_seqs=1; default_batch=4096
     warn "Extended context $MAX_MODEL_LEN > native $NATIVE_CONTEXT: validate quality and memory."
 else

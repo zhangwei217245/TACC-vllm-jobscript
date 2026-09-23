@@ -1,8 +1,8 @@
 """Serve the kit's UI through vLLM: --middleware static_ui.StaticUIMiddleware.
 
-VLLM_UI_DIR: static directory; VLLM_UI_PAGE: entry file (default chat.html).
-VLLM_PUBLIC_BASE_URL: optional browser-facing server root, without /v1.
-VLLM_UI_MODEL: optional default model name. These public settings are returned
+TACC_UI_DIR: static directory; TACC_UI_PAGE: entry file (default chat.html).
+TACC_PUBLIC_BASE_URL: optional browser-facing server root, without /v1.
+TACC_UI_MODEL: optional default model name. These public settings are returned
 by /ui/config.json; no API key or arbitrary environment values are exposed.
 With no public URL, the browser uses the origin and prefix of the UI page.
 Only /ui and /ui/... HTTP requests are intercepted. All other requests,
@@ -23,24 +23,24 @@ from starlette.staticfiles import StaticFiles
 class StaticUIMiddleware:
     def __init__(self, app):
         self.app = app
-        directory = os.environ.get("VLLM_UI_DIR", "")
+        directory = os.environ.get("TACC_UI_DIR", "")
         if not directory:
-            raise RuntimeError("Set VLLM_UI_DIR to the frontend directory")
+            raise RuntimeError("Set TACC_UI_DIR to the frontend directory")
         directory = Path(directory).resolve()
-        page = os.environ.get("VLLM_UI_PAGE", "chat.html")
+        page = os.environ.get("TACC_UI_PAGE", "chat.html")
         relative = PurePosixPath(page)
         if (not page or relative.is_absolute() or ".." in relative.parts
                 or any(c in page for c in "\\?#")
                 or any(ord(c) < 32 for c in page)
                 or relative.suffix.lower() not in {".html", ".htm"}):
-            raise RuntimeError("VLLM_UI_PAGE must be a relative HTML path inside VLLM_UI_DIR")
+            raise RuntimeError("TACC_UI_PAGE must be a relative HTML path inside TACC_UI_DIR")
         entry = (directory / page).resolve()
         if not entry.is_relative_to(directory) or not entry.is_file():
-            raise RuntimeError(f"UI entry missing or outside VLLM_UI_DIR: {entry}")
+            raise RuntimeError(f"UI entry missing or outside TACC_UI_DIR: {entry}")
         if not os.access(entry, os.R_OK):
             raise RuntimeError(f"UI entry is not readable: {entry}")
         self.page = relative.as_posix()
-        self.public_base = os.environ.get("VLLM_PUBLIC_BASE_URL", "").strip().rstrip("/")
+        self.public_base = os.environ.get("TACC_PUBLIC_BASE_URL", "").strip().rstrip("/")
         if self.public_base:
             url = urlsplit(self.public_base)
             # Public configuration cannot contain credentials, query tokens or fragments.
@@ -49,11 +49,11 @@ class StaticUIMiddleware:
                     or url.query or url.fragment
                     or any(c.isspace() or ord(c) < 32 for c in self.public_base)
                     or "\\" in self.public_base):
-                raise RuntimeError("VLLM_PUBLIC_BASE_URL must be an HTTP(S) server root without credentials/query/fragment")
+                raise RuntimeError("TACC_PUBLIC_BASE_URL must be an HTTP(S) server root without credentials/query/fragment")
             _ = url.port  # Validate numeric port syntax/range.
             if url.path.rstrip("/").endswith("/v1"):
-                raise RuntimeError("VLLM_PUBLIC_BASE_URL is the server root; omit the trailing /v1")
-        self.model = os.environ.get("VLLM_UI_MODEL", "")
+                raise RuntimeError("TACC_PUBLIC_BASE_URL is the server root; omit the trailing /v1")
+        self.model = os.environ.get("TACC_UI_MODEL", "")
         self.ui = Starlette(routes=[
             Route("/ui/config.json", self.config, methods=["GET", "HEAD"]),
             Route("/ui/", self.landing, methods=["GET", "HEAD"]),

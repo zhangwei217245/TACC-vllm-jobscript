@@ -245,3 +245,22 @@ update.
 inspect their path and host settings before use. For the Slurm workflow above,
 stop with `scancel`. `mpi-smoke.c` and `mpi-smoke.sbatch` provide a separate MPI
 test; the serving job uses `srun --mpi=none`.
+
+## Context-length validation and UI environment warnings
+
+If vLLM rejects `max_model_len=1048576` against a derived limit of `262144`,
+the request exceeds the checkpoint's native window. For extended profiles, the
+launcher now defaults `VLLM_ALLOW_LONG_MAX_MODEL_LEN=1` alongside its YaRN
+configuration. This opt-in only permits the length check; it does not establish
+long-context quality, GPU memory capacity, or draft-model context support.
+An explicit value of `0` is preserved. Native-length profiles do not set this flag.
+For a native-context baseline, use `CONTEXT_PROFILE=256k SPEC_METHOD=none` and
+ensure no conflicting `MAX_MODEL_LEN`, `SPEC_MODEL`, or `SPEC_TOKENS` overrides
+remain in your submission environment.
+
+The launcher still accepts the documented `VLLM_UI_*`, `VLLM_MIDDLEWARE_DIR`, and
+`VLLM_PUBLIC_BASE_URL` inputs. It passes middleware settings as `TACC_UI_DIR`,
+`TACC_UI_PAGE`, `TACC_UI_MODEL`, and `TACC_PUBLIC_BASE_URL` and removes the export
+attribute from the project-owned `VLLM_*` variables before starting vLLM. Update
+both the launcher and middleware together. This avoids vLLM's unknown-variable
+warnings without changing the public UI routes.
