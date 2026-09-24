@@ -2,3 +2,5 @@
 /.venv/
 /models/*
 !/models/models.txt
+__pycache__
+logs
