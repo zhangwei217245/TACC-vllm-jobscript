@@ -141,9 +141,14 @@ DFlash/EAGLE3; see the [model-specific evidence](dgxspark/README.md#primary-and-
 
 An opt-in [Qwen3Next PP+DFlash prototype](patches/qwen3next-pp/README.md) now
 provides a reversible patch for exactly vLLM 0.30.0. It implements the missing
-relay for experimental TP=1/PP=2 or 4 runs. CPU tests and simulated handoff pass;
-real GPU correctness and performance remain unverified. It is disabled by
-default and requires explicit installation and `TACC_QWEN3NEXT_PP_DFLASH=1`.
+relay for experimental target **TP>=1/PP>=1** runs, including TP=2/PP=2.
+Draft TP must match target TP in this V2 path; draft PP remains 1. Model
+divisibility, layer partitioning, and GPU-allocation constraints still apply.
+The preset defaults to `fastsafetensors` and rejects `instanttensor` with PP>1.
+CPU tests and simulated handoff pass; combined TP/PP GPU correctness and
+performance remain unverified. It is disabled by default and requires explicit
+installation and `TACC_QWEN3NEXT_PP_DFLASH=1`. Existing r1 installations upgrade
+with the same patch tool's `--apply` command; see the guide above.
 
 ## Browser chat UI
 

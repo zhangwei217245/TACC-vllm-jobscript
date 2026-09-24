@@ -309,11 +309,11 @@ vLLM's unknown-variable warnings.
 | --- | --- | --- |
 | `TP_SIZE` / `PP_SIZE` | 2 / 2 | 2 / 2 |
 | `SPEC_METHOD` | `none` | `none` |
-| `SPEC_TP_SIZE` | 1 when model-based drafting is selected | 1 |
+| `SPEC_TP_SIZE` | Target TP with the relay patch enabled; otherwise 1 | Same |
 | `CONTEXT_PROFILE` | `1m` | `1m` |
 | `MAX_NUM_SEQS` | 8 | 1 above native context; 4 otherwise |
 | `MAX_NUM_BATCHED_TOKENS` | 8192 | 4096 above native context; 8192 otherwise |
-| `LOAD_FORMAT` | Inherits launcher's `instanttensor` | `instanttensor` |
+| `LOAD_FORMAT` | Inherits launcher | `fastsafetensors` with the relay patch enabled; otherwise `instanttensor` |
 | `VLLM_UI_ENABLE` | 1 | 1 |
 
 The batch wrapper exports its values to each launcher, so these override the
@@ -389,21 +389,32 @@ framework support alone does not predict throughput.
 ### Experimental local relay patch
 
 The repository includes a reversible, opt-in patch for **exactly vLLM 0.30.0**.
-It adds Qwen3Next auxiliary-state relay for a first DFlash experiment at target
-TP=1/PP=2 or 4, with draft TP=1/PP=1. See the
+Revision r2 permits positive target TP/PP sizes, including TP=2/PP=2 and PP=1,
+subject to vLLM's model divisibility and partitioning constraints and the allocated
+GPU count. Draft TP defaults to target TP and must match it in this V2 DFlash
+path; draft PP remains 1. A stale `SPEC_TP_SIZE=1` must be unset or changed when
+target TP increases. See the
 [installation, launch, rollback, and GPU validation guide](../patches/qwen3next-pp/README.md).
 
 Install it with the serving environment's Python using
 `utility/qwen3next_pp_patch.py --apply`, once per distinct environment while
 jobs are stopped. The launcher only enables it with
 `TACC_QWEN3NEXT_PP_DFLASH=1`; it then checks the exact patched source and imported
-capability on every node. The prototype requires DFlash, target TP=1, eager
-execution, native context, and no HF overrides. Its patch ID is included in
-the configuration fingerprint. Other startup defaults are unchanged.
+capability on every node, including with PP=1. `--apply` also upgrades an exact
+r1 installation; modified sources are still rejected. The prototype requires
+DFlash, V2, eager execution, native context, no sequence parallelism, and no HF
+overrides. Its patch ID is included in the configuration fingerprint.
 
-CPU relay tests and simulated Slurm handoff pass. **This is not yet validated
-with real weights on the Sparks**: recurrent-state restoration, GPU kernels,
-and throughput still need the checks in the guide. It is a source patch, not
+The experimental preset defaults `LOAD_FORMAT=fastsafetensors`: upstream uses
+the standard loader for the draft on the last pipeline stage. Explicit `auto`
+also works. `instanttensor` is rejected with PP>1 because its world-group draft
+loading can wait for ranks that are not loading the draft. Ordinary runs retain
+their previous loader default.
+
+CPU relay tests and simulated Slurm handoff pass. The user has reported a
+working TP=1/PP=4 run; **r2's combined TP/PP behavior is not yet validated with
+real weights on the Sparks**. Recurrent-state restoration, GPU kernels, and
+throughput still need the checks in the guide. It is a source patch, not
 HTTP middleware or a registered vLLM plugin.
 
 ## Startup failures

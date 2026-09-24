@@ -13,7 +13,7 @@
  
  @support_torch_compile
  class Qwen3NextModel(nn.Module, EagleModelMixin):
-+    _tacc_pp_patch = "qwen3next-dflash-pp-v030-r1"
++    _tacc_pp_patch = "qwen3next-dflash-pp-v030-r2"
 +    supports_aux_hidden_states_over_pp = (
 +        os.environ.get("TACC_QWEN3NEXT_PP_DFLASH") == "1"
 +    )
@@ -21,7 +21,7 @@
      hf_to_vllm_mapper = WeightsMapper(
          orig_to_new_stacked={
              # weight_name: (param_name, shard_id)
-@@ -639,6 +646,21 @@
+@@ -639,6 +646,25 @@
  
          config: Qwen3NextConfig = vllm_config.model_config.hf_text_config
          parallel_config = vllm_config.parallel_config
@@ -29,21 +29,25 @@
 +            spec = vllm_config.speculative_config
 +            if (
 +                config.model_type != "qwen3_next"
-+                or parallel_config.tensor_parallel_size != 1
-+                or parallel_config.pipeline_parallel_size not in (1, 2, 4)
++                or parallel_config.tensor_parallel_size < 1
++                or parallel_config.pipeline_parallel_size < 1
 +                or parallel_config.use_sequence_parallel_moe
 +                or spec is None
 +                or spec.method != "dflash"
++                or spec.draft_tensor_parallel_size not in (
++                    None, parallel_config.tensor_parallel_size
++                )
 +                or os.environ.get("VLLM_USE_V2_MODEL_RUNNER") != "1"
 +            ):
 +                raise RuntimeError(
 +                    "Experimental Qwen3Next relay requires qwen3_next, "
-+                    "DFlash, V2, TP=1, PP=1/2/4, and no sequence parallelism"
++                    "DFlash, V2, TP>=1, PP>=1, draft TP matching target TP, "
++                    "and no sequence parallelism"
 +                )
  
          eplb_config = parallel_config.eplb_config
          self.num_redundant_experts = eplb_config.num_redundant_experts
-@@ -708,7 +730,21 @@
+@@ -708,7 +734,21 @@
              hidden_states = sequence_parallel_chunk(hidden_states)
              assert residual is None
  
@@ -66,7 +70,7 @@
          for layer_idx, layer in enumerate(
              islice(self.layers, self.start_layer, self.end_layer),
              start=self.start_layer,
-@@ -724,7 +760,12 @@
+@@ -724,7 +764,12 @@
  
          if not get_pp_group().is_last_rank:
              return IntermediateTensors(
@@ -80,7 +84,7 @@
              )
          hidden_states, _ = self.norm(hidden_states, residual)
          if self.use_sequence_parallel:
-@@ -739,6 +780,9 @@
+@@ -739,6 +784,9 @@
              else:
                  hidden_states = tensor_model_parallel_all_gather(hidden_states, 0)
                  hidden_states = hidden_states[:full_num_tokens]

@@ -119,7 +119,7 @@ Static web UI (optional, head only):
 
 Speculative decoding (default off):
   SPEC_METHOD=none|ngram|dflash|eagle3
-  SPEC_TP_SIZE=1                     (draft TP; model-based methods only)
+  SPEC_TP_SIZE                       (draft TP; default target TP with relay patch, else 1)
   TACC_QWEN3NEXT_PP_DFLASH=0          (opt-in experimental v0.30.0 source patch;
     apply utility/qwen3next_pp_patch.py first on every node; see patches/qwen3next-pp)
   SPEC_TOKENS                        (defaults: ngram=4, dflash=15, eagle3=3)
@@ -133,7 +133,8 @@ Speculative decoding (default off):
   DFlash/EAGLE3 with PP>1: requires Model Runner V2, draft PP=1, and Qwen3Next
   auxiliary-state relay support. Checked in the installed build before loading.
   Stock v0.30.0 Qwen3Next lacks that relay. The opt-in prototype requires
-  TP=1, PP=2/4, draft TP=1, DFlash, native context, and eager execution.
+  TP>=1, PP>=1, draft TP=target TP, DFlash, V2, native context, and eager execution.
+  The prototype defaults LOAD_FORMAT=fastsafetensors; instanttensor is rejected at PP>1.
   Otherwise use SPEC_METHOD=none for TP=2/PP=2, or TP=4/PP=1 for drafting.
   N-gram is not implemented in the checked V2 runner; this preset uses PP=1.
 
@@ -280,7 +281,11 @@ positive_int MAX_MODEL_LEN
 GPU_MEM_UTILIZATION=${GPU_MEM_UTILIZATION:-0.75}
 DTYPE=${DTYPE:-auto}
 KV_CACHE_DTYPE=${KV_CACHE_DTYPE:-auto}
-LOAD_FORMAT=${LOAD_FORMAT:-instanttensor}
+if (( TACC_QWEN3NEXT_PP_DFLASH )); then
+    LOAD_FORMAT=${LOAD_FORMAT:-fastsafetensors}
+else
+    LOAD_FORMAT=${LOAD_FORMAT:-instanttensor}
+fi
 PREFIX_CACHING=${PREFIX_CACHING:-1}
 CHUNKED_PREFILL=${CHUNKED_PREFILL:-1}
 ENFORCE_EAGER=${ENFORCE_EAGER:-$TACC_QWEN3NEXT_PP_DFLASH}
@@ -380,14 +385,18 @@ fi
 SPEC_METHOD=${SPEC_METHOD:-none}
 if (( TACC_QWEN3NEXT_PP_DFLASH )); then
     [[ $SPEC_METHOD == dflash ]] || die 'Experimental relay requires SPEC_METHOD=dflash.'
-    (( TP_SIZE == 1 && (PP_SIZE == 2 || PP_SIZE == 4) )) ||
-        die 'Experimental relay requires TP_SIZE=1 and PP_SIZE=2 or 4.'
+    # Positive sizes and allocation equality have already been checked above.
+    export VLLM_USE_V2_MODEL_RUNNER=${VLLM_USE_V2_MODEL_RUNNER:-1}
+    [[ $VLLM_USE_V2_MODEL_RUNNER == 1 ]] || die 'Experimental relay requires VLLM_USE_V2_MODEL_RUNNER=1.'
+    if (( PP_SIZE > 1 )) && [[ $LOAD_FORMAT == instanttensor ]]; then
+        die 'Experimental PP drafting cannot use instanttensor world-group loading; use LOAD_FORMAT=fastsafetensors or auto.'
+    fi
     (( ENFORCE_EAGER == 1 )) || die 'Experimental relay currently requires ENFORCE_EAGER=1.'
     (( MAX_MODEL_LEN <= NATIVE_CONTEXT )) && [[ $HF_CONFIG == '{}' ]] ||
         die 'Experimental relay requires native context and no HF_OVERRIDES; start with CONTEXT_PROFILE=128k.'
     "$PYTHON" "$DEPLOY_KIT_ROOT/utility/qwen3next_pp_patch.py" --check >&2 ||
         die 'Install the pinned relay patch in this serving environment before enabling it.'
-    QWEN3NEXT_PATCH_ID=qwen3next-dflash-pp-v030-r1
+    QWEN3NEXT_PATCH_ID=qwen3next-dflash-pp-v030-r2
     warn "EXPERIMENTAL $QWEN3NEXT_PATCH_ID: GPU correctness and throughput remain unverified."
 fi
 SPEC_CONFIG=
@@ -409,8 +418,15 @@ case $SPEC_METHOD in
                 SPEC_MODEL=${SPEC_MODEL:-togethercomputer/Aurora-Spec-Qwen3-Coder-Next-FP8}
                 warn 'Aurora EAGLE3 author documents SGLang; validate this vLLM combination.' ;;
         esac
-        SPEC_TP_SIZE=${SPEC_TP_SIZE:-1}
+        if (( TACC_QWEN3NEXT_PP_DFLASH )); then
+            SPEC_TP_SIZE=${SPEC_TP_SIZE:-$TP_SIZE}
+        else
+            SPEC_TP_SIZE=${SPEC_TP_SIZE:-1}
+        fi
         positive_int SPEC_TP_SIZE
+        if (( TACC_QWEN3NEXT_PP_DFLASH && SPEC_TP_SIZE != TP_SIZE )); then
+            die 'Experimental V2 DFlash requires SPEC_TP_SIZE=TP_SIZE; unset SPEC_TP_SIZE to follow target TP.'
+        fi
         if [[ $SPEC_METHOD != ngram ]]; then
             (( SPEC_TP_SIZE == 1 || SPEC_TP_SIZE == TP_SIZE )) ||
                 die 'SPEC_TP_SIZE must be 1 or match target TP_SIZE.'
@@ -437,7 +453,9 @@ if method == 'ngram':
 else:
     config['model'] = model
     config['draft_tensor_parallel_size'] = int(draft_tp)
-    if int(target_pp) > 1:
+    import os
+    experimental = os.environ.get('TACC_QWEN3NEXT_PP_DFLASH') == '1'
+    if int(target_pp) > 1 or experimental:
         # No weights instantiated. Send import/config logs to stderr so the shell
         # captures exactly one JSON document, even if vLLM logs to stdout.
         try:
@@ -445,9 +463,8 @@ else:
                 from vllm.config import ParallelConfig, SpeculativeConfig
                 from vllm.v1.worker.gpu import model_runner
                 from vllm.model_executor.models.qwen3_next import Qwen3NextModel
-                import os
-                if os.environ.get('TACC_QWEN3NEXT_PP_DFLASH') == '1':
-                    if getattr(Qwen3NextModel, '_tacc_pp_patch', None) != 'qwen3next-dflash-pp-v030-r1':
+                if experimental:
+                    if getattr(Qwen3NextModel, '_tacc_pp_patch', None) != 'qwen3next-dflash-pp-v030-r2':
                         raise RuntimeError('experimental patch was not loaded by this Python process')
                     with open(os.path.join(target_path, 'config.json')) as f:
                         if json.load(f).get('model_type') != 'qwen3_next':

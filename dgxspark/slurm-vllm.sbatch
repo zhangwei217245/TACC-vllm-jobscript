@@ -157,7 +157,12 @@ case $SPEC_METHOD in
     *) die 'SPEC_METHOD must be none, ngram, dflash, or eagle3.' ;;
 esac
 # Draft PP is fixed to 1 by compatible vLLM builds, not a CLI option.
-export SPEC_TP_SIZE=${SPEC_TP_SIZE:-1}
+# V2 DFlash uses the target TP group, including on the last PP stage.
+if [[ ${TACC_QWEN3NEXT_PP_DFLASH:-0} == 1 ]]; then
+    export SPEC_TP_SIZE=${SPEC_TP_SIZE:-$TP_SIZE}
+else
+    export SPEC_TP_SIZE=${SPEC_TP_SIZE:-1}
+fi
 # UI settings are frontend-only; workers never load the middleware or UI files.
 export VLLM_UI_ENABLE=${VLLM_UI_ENABLE:-1}
 export VLLM_MIDDLEWARE_DIR=${VLLM_MIDDLEWARE_DIR:-$DEPLOY_KIT_ROOT/vllm_middleware}

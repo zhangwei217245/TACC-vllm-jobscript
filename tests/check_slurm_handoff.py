@@ -202,16 +202,37 @@ for r in records:
     assert r['env']['VLLM_USE_V2_MODEL_RUNNER']=='1'
     assert '--enforce-eager' in r['args']
     assert json.loads(arg(r,'--speculative-config'))['draft_tensor_parallel_size']==1
+    assert arg(r,'--load-format')=='fastsafetensors'
 records,_,_=run('prototype-two-nodes',{**experimental,'SLURM_JOB_NUM_NODES':'2','PP_SIZE':'2'})
 assert len(records)==2
 run('prototype-without-optin',{**experimental,'TACC_QWEN3NEXT_PP_DFLASH':'0'},fail='lacks auxiliary hidden-state relay')
 run('prototype-wrong-method',{**experimental,'SPEC_METHOD':'eagle3'},fail='requires SPEC_METHOD=dflash')
-run('prototype-wrong-tp',{**experimental,'TP_SIZE':'2','PP_SIZE':'2'},fail='requires TP_SIZE=1')
+for tp,pp in [(2,2),(4,1),(2,3),(1,1),(1,8)]:
+    records,_,_=run(f'prototype-tp{tp}-pp{pp}',{
+        **experimental,'TP_SIZE':str(tp),'PP_SIZE':str(pp),
+        'SLURM_JOB_NUM_NODES':str(tp*pp)})
+    assert len(records)==tp*pp
+    for r in records:
+        assert arg(r,'--tensor-parallel-size')==str(tp)
+        assert arg(r,'--pipeline-parallel-size')==str(pp)
+        assert json.loads(arg(r,'--speculative-config'))['draft_tensor_parallel_size']==tp
+        assert r['env']['VLLM_USE_V2_MODEL_RUNNER']=='1'
+run('prototype-mismatched-draft-tp',{**experimental,'TP_SIZE':'2','PP_SIZE':'2','SPEC_TP_SIZE':'1'},
+    fail='requires SPEC_TP_SIZE=TP_SIZE')
+run('prototype-instanttensor-pp',{**experimental,'LOAD_FORMAT':'instanttensor'},
+    fail='cannot use instanttensor')
+records,_,_=run('prototype-auto-loader',{**experimental,'LOAD_FORMAT':'auto'})
+assert all(arg(r,'--load-format')=='auto' for r in records)
+run('prototype-zero-tp',{**experimental,'TP_SIZE':'0'},fail='TP_SIZE must be positive')
+run('prototype-zero-pp',{**experimental,'PP_SIZE':'0'},fail='PP_SIZE must be positive')
 run('prototype-no-eager',{**experimental,'ENFORCE_EAGER':'0'},fail='requires ENFORCE_EAGER=1')
 run('prototype-extended-context',{**experimental,'CONTEXT_PROFILE':'1m'},fail='requires native context')
 run('prototype-v1',{**experimental,'VLLM_USE_V2_MODEL_RUNNER':'0'},fail='requires VLLM_USE_V2_MODEL_RUNNER=1')
+run('prototype-pp1-v1',{**experimental,'TP_SIZE':'4','PP_SIZE':'1','VLLM_USE_V2_MODEL_RUNNER':'0'},
+    fail='requires VLLM_USE_V2_MODEL_RUNNER=1')
 write(project/'models/Qwen--Qwen3-Coder-Next-FP8/config.json',json.dumps(dict(model_type='qwen3',max_position_embeddings=262144)))
 run('prototype-wrong-model',experimental,fail='only supports model_type=qwen3_next')
+run('prototype-pp1-wrong-model',{**experimental,'TP_SIZE':'4','PP_SIZE':'1'},fail='only supports model_type=qwen3_next')
 write(project/'models/Qwen--Qwen3-Coder-Next-FP8/config.json',config)
 source.write_bytes(source.read_bytes()+b'\n# unexpected local edit\n')
 run('prototype-modified-source',experimental,fail='differs from the pinned')

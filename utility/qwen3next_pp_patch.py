@@ -14,7 +14,9 @@ from pathlib import Path
 import stat
 import tempfile
 
-PATCH_ID = "qwen3next-dflash-pp-v030-r1"
+PATCH_ID = "qwen3next-dflash-pp-v030-r2"
+LEGACY_PATCH_ID = "qwen3next-dflash-pp-v030-r1"
+LEGACY_SHA256 = "bf2c6fbd3797dbc99899b531aac7f65ea23e71a457e2c63226be7a762d3ef186"
 UPSTREAM_SHA256 = "4fa5112ac2bf7886d41d9e1f6c3da8793620d1ec49c961b31e9609459a6a7f7a"
 MODEL_FILE = "vllm/model_executor/models/qwen3_next.py"
 
@@ -39,16 +41,20 @@ EDITS = (
         "            spec = vllm_config.speculative_config\n"
         "            if (\n"
         '                config.model_type != "qwen3_next"\n'
-        "                or parallel_config.tensor_parallel_size != 1\n"
-        "                or parallel_config.pipeline_parallel_size not in (1, 2, 4)\n"
+        "                or parallel_config.tensor_parallel_size < 1\n"
+        "                or parallel_config.pipeline_parallel_size < 1\n"
         "                or parallel_config.use_sequence_parallel_moe\n"
         "                or spec is None\n"
         '                or spec.method != "dflash"\n'
+        "                or spec.draft_tensor_parallel_size not in (\n"
+        "                    None, parallel_config.tensor_parallel_size\n"
+        "                )\n"
         '                or os.environ.get("VLLM_USE_V2_MODEL_RUNNER") != "1"\n'
         "            ):\n"
         "                raise RuntimeError(\n"
         '                    "Experimental Qwen3Next relay requires qwen3_next, "\n'
-        '                    "DFlash, V2, TP=1, PP=1/2/4, and no sequence parallelism"\n'
+        '                    "DFlash, V2, TP>=1, PP>=1, draft TP matching target TP, "\n'
+        '                    "and no sequence parallelism"\n'
         "                )\n",
     ),
     (
@@ -89,14 +95,31 @@ EDITS = (
     ),
 )
 
+# Only the marker and constructor guard changed from r1. Reconstruct its exact
+# edits for a hash-checked migration; never accept arbitrary previously edited code.
+LEGACY_EDITS = tuple(
+    (before, after.replace(PATCH_ID, LEGACY_PATCH_ID)
+     .replace("parallel_config.tensor_parallel_size < 1",
+              "parallel_config.tensor_parallel_size != 1")
+     .replace("parallel_config.pipeline_parallel_size < 1",
+              "parallel_config.pipeline_parallel_size not in (1, 2, 4)")
+     .replace("                or spec.draft_tensor_parallel_size not in (\n"
+              "                    None, parallel_config.tensor_parallel_size\n"
+              "                )\n", "")
+     .replace('"DFlash, V2, TP>=1, PP>=1, draft TP matching target TP, "\n'
+              '                    "and no sequence parallelism"',
+              '"DFlash, V2, TP=1, PP=1/2/4, and no sequence parallelism"'))
+    for before, after in EDITS
+)
+
 
 def digest(data):
     return hashlib.sha256(data).hexdigest()
 
 
-def transform(data, reverse=False):
+def transform(data, reverse=False, edits=EDITS):
     text = data.decode("utf-8")
-    for before, after in (reversed(EDITS) if reverse else EDITS):
+    for before, after in (reversed(edits) if reverse else edits):
         old, new = (after, before) if reverse else (before, after)
         if text.count(old) != 1:
             raise ValueError("Source does not match the exact patch anchors; refusing changes")
@@ -108,6 +131,8 @@ def transform(data, reverse=False):
 def source_state(data):
     if digest(data) == UPSTREAM_SHA256:
         return "upstream"
+    if digest(data) == LEGACY_SHA256:
+        return "patched-r1"
     try:
         restored = transform(data, reverse=True)
     except (ValueError, SyntaxError, UnicodeError):
@@ -133,6 +158,8 @@ def update_source(path, action):
         if state == "unknown":
             raise ValueError("Installed source differs from the pinned upstream/patch; refusing changes")
         if action == "check" and state != "patched":
+            if state == "patched-r1":
+                raise ValueError("Patch r1 is installed; run --apply to upgrade to r2")
             raise ValueError("Patch is not installed; run this tool with --apply first")
         return state
     lock = path.with_name(path.name + ".tacc-patch.lock")
@@ -147,7 +174,13 @@ def update_source(path, action):
         desired = "patched" if action == "apply" else "upstream"
         if state == desired:
             return state
-        result = transform(data, reverse=action == "revert")
+        if state == "patched-r1":
+            upstream = transform(data, reverse=True, edits=LEGACY_EDITS)
+            if digest(upstream) != UPSTREAM_SHA256:
+                raise ValueError("Legacy patch restoration failed")
+            result = transform(upstream) if action == "apply" else upstream
+        else:
+            result = transform(data, reverse=action == "revert")
         if source_state(result) != desired:
             raise ValueError("Patch verification failed")
         with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as out:
