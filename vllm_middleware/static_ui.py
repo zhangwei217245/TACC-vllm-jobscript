@@ -7,6 +7,7 @@ by /ui/config.json; no API key or arbitrary environment values are exposed.
 With no public URL, the browser uses the origin and prefix of the UI page.
 Only /ui and /ui/... HTTP requests are intercepted. All other requests,
 WebSockets and lifespan events pass to vLLM unchanged. No SPA fallback.
+Legacy VLLM_* inputs remain readable for older launchers; TACC_* takes precedence.
 """
 
 import os
@@ -20,14 +21,19 @@ from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
 
+def _setting(suffix: str, default: str = "") -> str:
+    # New launcher exports only TACC_*; the fallback supports older launchers.
+    return os.environ.get("TACC_" + suffix, os.environ.get("VLLM_" + suffix, default))
+
+
 class StaticUIMiddleware:
     def __init__(self, app):
         self.app = app
-        directory = os.environ.get("TACC_UI_DIR", "")
+        directory = _setting("UI_DIR")
         if not directory:
             raise RuntimeError("Set TACC_UI_DIR to the frontend directory")
         directory = Path(directory).resolve()
-        page = os.environ.get("TACC_UI_PAGE", "chat.html")
+        page = _setting("UI_PAGE", "chat.html")
         relative = PurePosixPath(page)
         if (not page or relative.is_absolute() or ".." in relative.parts
                 or any(c in page for c in "\\?#")
@@ -40,7 +46,7 @@ class StaticUIMiddleware:
         if not os.access(entry, os.R_OK):
             raise RuntimeError(f"UI entry is not readable: {entry}")
         self.page = relative.as_posix()
-        self.public_base = os.environ.get("TACC_PUBLIC_BASE_URL", "").strip().rstrip("/")
+        self.public_base = _setting("PUBLIC_BASE_URL").strip().rstrip("/")
         if self.public_base:
             url = urlsplit(self.public_base)
             # Public configuration cannot contain credentials, query tokens or fragments.
@@ -53,7 +59,7 @@ class StaticUIMiddleware:
             _ = url.port  # Validate numeric port syntax/range.
             if url.path.rstrip("/").endswith("/v1"):
                 raise RuntimeError("TACC_PUBLIC_BASE_URL is the server root; omit the trailing /v1")
-        self.model = os.environ.get("TACC_UI_MODEL", "")
+        self.model = _setting("UI_MODEL")
         self.ui = Starlette(routes=[
             Route("/ui/config.json", self.config, methods=["GET", "HEAD"]),
             Route("/ui/", self.landing, methods=["GET", "HEAD"]),

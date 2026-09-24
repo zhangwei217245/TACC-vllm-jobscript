@@ -1,8 +1,10 @@
 # Serve Qwen3-Coder-Next on DGX Spark with Slurm
 
 The batch script requests four nodes with one GPU per node and starts one
-launcher per node. The primary model defaults to TP=1, PP=4 (one pipeline stage
-per node). The draft defaults to TP=1, PP=1 and runs on the last pipeline stage.
+launcher per node. The primary model defaults to TP=2, PP=2: each pipeline
+stage has two tensor ranks across pairs of nodes. Speculative decoding is off
+by default, matching `launch-vllm.sh`. The batch script retains its higher
+concurrency defaults.
 The first allocated node runs the HTTP API and web UI.
 
 ## Repository layout and path resolution
@@ -36,10 +38,12 @@ its working directory. Slurm runs a spooled copy of the batch script, so that
 script instead finds the launcher from the submission directory (repository
 root or `dgxspark/`), or an explicit `DEPLOY_KIT_ROOT` or `LAUNCHER` override.
 
-Use absolute paths for overrides. A relative `NETWORK_SCRIPT` is resolved
-against the caller's directory for direct launches, or `SLURM_SUBMIT_DIR` for
-batch launches. `--chdir` controls logs, not helper discovery. Both scripts check
-that the helper is readable; no copy or symlink into `dgxspark/` is needed.
+Use absolute paths for overrides. Relative `NETWORK_SCRIPT`, `MODEL_LIST`,
+`MODEL_REPO`, `MODEL_PATH`, `VLLM_UI_DIR` and `VLLM_MIDDLEWARE_DIR` overrides are
+resolved against `SLURM_SUBMIT_DIR` by the batch script. For direct launches,
+relative file paths use the caller's directory. `SPEC_MODEL` must be an absolute
+local directory or a Hugging Face repository ID. `--chdir` controls logs, not
+helper discovery. Both scripts check that the helper is readable; no copy or symlink into `dgxspark/` is needed.
 
 ## 1. Prepare the environment
 
@@ -55,7 +59,7 @@ bash "$DEPLOY_KIT_ROOT/utility/installer.sh"
 Run the installer on a Linux DGX node with GPU access under your site's
 allocation policy. It currently defaults to Python 3.14 and vLLM 0.30.0,
 overridable through `PYTHON_VERSION` and `VLLM_VERSION`. It creates
-`$PROJECT/.venv` and `$PROJECT/models` and checks CUDA visibility.
+`.venv/` and `models/` at the installer's repository root and checks CUDA visibility.
 
 Keep the checkout, environment and model files available at the same absolute
 paths on every node. Install separately on each node if the environment is not
@@ -101,7 +105,7 @@ or gated repositories, first run `"$PROJECT/.venv/bin/hf" auth login`.
 
 `slurm-vllm.sbatch` reads `$PROJECT/models/models.txt` by default. Set `MODEL_LIST`
 to use a custom file; relative paths resolve against `SLURM_SUBMIT_DIR`.
-It derives these defaults from the example above:
+For the example above, `SPEC_METHOD=dflash` selects these paths and names:
 
 ```text
 MODEL_NAME=Qwen--Qwen3-Coder-Next-FP8
@@ -115,13 +119,17 @@ API/UI `SERVED_MODEL_NAME`. Explicit `MODEL_NAME`, `MODEL_PATH`, `SPEC_MODEL`, a
 `SERVED_MODEL_NAME` overrides take precedence. `MODEL_REPO` overrides the checkpoint
 parent directory; it does not change the default list location.
 
-The batch script uses the second entry for `SPEC_METHOD=dflash` (the default) or
+The batch script uses the second entry for `SPEC_METHOD=dflash` or
 `SPEC_METHOD=eagle3` (EAGLE3). Select the method explicitly to match the auxiliary
-checkpoint; the list does not infer it. These methods require a second entry
+checkpoint; the list does not infer it. The default is `SPEC_METHOD=none`, which
+loads no draft. Model-based methods require a second entry
 unless `SPEC_MODEL` is explicitly supplied. `SPEC_METHOD=none` and `ngram` do not
 use the second entry and allow a one-model list. Do not export `SPEC_MODEL` for
 those methods. DSpark is not currently a supported launcher preset; this list
 change does not add a DSpark backend.
+
+Direct `launch-vllm.sh` runs do not read `models.txt`; supply model overrides
+explicitly or use its built-in Qwen checkpoint default.
 
 Keep the complete downloaded checkpoints at the same paths on every node. The
 model list is tracked in Git; downloaded model folders and `.venv/` are ignored.
@@ -144,14 +152,16 @@ interface selection.
 
 Start with 128K context, one sequence, no speculation and the auto weight
 loader. These explicit overrides avoid the batch script's experimental defaults
-of 1M context, eight sequences and DFlash with 15 draft tokens, and the
-launcher's `instanttensor` loader.
+of 1M context and eight sequences, and the launcher's `instanttensor` loader.
+Both entry points default to TP=2/PP=2 with speculation off.
 
 ```bash
+export TP_SIZE=2 PP_SIZE=2
 export CONTEXT_PROFILE=128k
 export MAX_NUM_SEQS=1
 export MAX_NUM_BATCHED_TOKENS=8192
 export SPEC_METHOD=none
+unset SPEC_MODEL SPEC_TOKENS
 export LOAD_FORMAT=auto
 export SERVICE_PORT=8040
 mkdir -p "$DEPLOY_KIT_ROOT/logs"
@@ -164,8 +174,9 @@ sbatch --export=ALL --time=01:00:00 \
 Add your site's required `--account`, `--partition` and GPU request (for example,
 `--gres=gpu:1` where configured) to both submission commands. The script defaults
 to four nodes, one task per node and `--mem=0` (all schedulable host memory).
-It assumes one visible GPU per node. Overriding `--nodes` changes the default
-PP size; the model and memory capacity must support the resulting configuration.
+It assumes one visible GPU per node. The defaults are fixed at TP=2/PP=2;
+when overriding `--nodes`, set both `TP_SIZE` and `PP_SIZE` so their product
+matches the allocated node count. The batch script rejects mismatches.
 
 Dry-run still uses an allocation and checks CUDA, model configuration, network
 selection, UI imports and local port availability. It prints commands without
@@ -200,7 +211,10 @@ tail -f "$DEPLOY_KIT_ROOT/logs/vllm-run-$JOB_ID.out"
 Read the first host's node log for `HTTP candidate:` and vLLM startup messages.
 The candidate is printed before vLLM is ready. `HEAD_IP:8041` is the engine
 rendezvous endpoint, not the HTTP API. Compare configuration fingerprints across
-node logs; there is no automatic remote consistency check.
+node logs; there is no automatic remote consistency check. Fingerprints include
+runner selection and the extended-context environment switch, but do not compare
+weight contents or package versions. The serving step explicitly uses the initial
+job working directory, with absolute paths passed to each launcher.
 
 Without `--chdir`, logs go into the submission directory. When submitting from
 outside the checkout, retain the absolute `DEPLOY_KIT_ROOT` export above.
@@ -221,7 +235,29 @@ curl --noproxy '*' "$BASE_URL/v1/chat/completions" \
 Open `<BASE_URL>/ui/` for the bundled chat page. It is enabled by default; export
 `VLLM_UI_ENABLE=0` before submission to disable it. Leave `VLLM_PUBLIC_BASE_URL`
 unset for browser same-origin requests, or set it to the browser-facing server
-root without `/v1` when using a proxy.
+root without `/v1` when using a proxy. `/ui/config.json` supplies the public model
+name and API-base override; it never includes an API key.
+
+Each assistant response includes a live tok/s chart, retained when streaming
+finishes, and min/max/mean/median tok/s statistics. Stop/error responses retain
+statistics for the partial output and are labeled partial/failed. Each generated
+code block has a **Copy code** button and a language label; **Copy Markdown**
+copies the whole response. Copying falls back to an HTTP-compatible mechanism
+and then manual selection if the browser denies clipboard access.
+
+The chart uses one-second arrival windows from first output, including reasoning
+and pauses; the last window can be shorter. Mean is the arithmetic average of
+window rates, and median is the middle rate (or average of the two middle rates).
+The top-level tok/s metric remains total output tokens divided by request time,
+including TTFT. These metrics measure browser-observed arrivals, not server-only
+GPU throughput.
+
+Final and continuous usage requests are enabled by default. The chart uses
+server completion-token counts if present and positive with the first output
+delta; otherwise it uses an explicitly marked Unicode-characters/4 estimate for
+the whole response. A final-only count updates totals, not historical chart
+samples. For APIs that reject `stream_options`, turn off both usage checkboxes.
+Keys, settings and conversations are kept only in page memory.
 
 If you export `VLLM_API_KEY` before submission, add
 `-H "Authorization: Bearer $VLLM_API_KEY"` to the API requests and configure your
@@ -259,34 +295,142 @@ For a native-context baseline, use `CONTEXT_PROFILE=256k SPEC_METHOD=none` and
 ensure no conflicting `MAX_MODEL_LEN`, `SPEC_MODEL`, or `SPEC_TOKENS` overrides
 remain in your submission environment.
 
-The launcher still accepts the documented `VLLM_UI_*`, `VLLM_MIDDLEWARE_DIR`, and
+The launcher accepts the documented `VLLM_UI_*`, `VLLM_MIDDLEWARE_DIR`, and
 `VLLM_PUBLIC_BASE_URL` inputs. It passes middleware settings as `TACC_UI_DIR`,
 `TACC_UI_PAGE`, `TACC_UI_MODEL`, and `TACC_PUBLIC_BASE_URL` and removes the export
-attribute from the project-owned `VLLM_*` variables before starting vLLM. Update
-both the launcher and middleware together. This avoids vLLM's unknown-variable
-warnings without changing the public UI routes.
+attribute from the project-owned `VLLM_*` variables before starting vLLM.
+The middleware accepts legacy `VLLM_*` settings as a fallback, with `TACC_*`
+taking precedence. Update both the launcher and middleware together to avoid
+vLLM's unknown-variable warnings.
 
 ## Primary and draft parallelism
 
-The four-node batch job defaults to `TP_SIZE=1`, `PP_SIZE=$NUM_NODES` (4), and
-`SPEC_TP_SIZE=1`. Direct launches default to TP equal to local visible GPUs and
-PP equal to the number of hosts. The draft JSON sets `draft_tensor_parallel_size`;
-compatible vLLM builds fix draft PP to 1 internally. There is no `SPEC_PP_SIZE` flag.
-Explicit TP/PP overrides are preserved, and target TP times PP must equal the
-total allocated GPU count.
+| Setting | Slurm batch default | Direct launcher default |
+| --- | --- | --- |
+| `TP_SIZE` / `PP_SIZE` | 2 / 2 | 2 / 2 |
+| `SPEC_METHOD` | `none` | `none` |
+| `SPEC_TP_SIZE` | 1 when model-based drafting is selected | 1 |
+| `CONTEXT_PROFILE` | `1m` | `1m` |
+| `MAX_NUM_SEQS` | 8 | 1 above native context; 4 otherwise |
+| `MAX_NUM_BATCHED_TOKENS` | 8192 | 4096 above native context; 8192 otherwise |
+| `LOAD_FORMAT` | Inherits launcher's `instanttensor` | `instanttensor` |
+| `VLLM_UI_ENABLE` | 1 | 1 |
 
-For DFlash or EAGLE3 with target PP greater than 1, the launcher selects
-`VLLM_USE_V2_MODEL_RUNNER=1` and checks that the installed vLLM creates draft PP=1
-and provides auxiliary hidden-state relay validation. Older builds fail early
-with an upgrade/fallback message. Passing this preflight does not prove the
-specific target architecture supports the relay: vLLM checks that during model
-loading. The installed version must contain these capabilities; the installer
-version pin alone is not a compatibility guarantee.
+The batch wrapper exports its values to each launcher, so these override the
+launcher's own defaults. It exports `SLURM_EXPORT_ENV=ALL` and uses
+`srun --export=ALL`; this cannot restore variables discarded by `sbatch --export=NONE`.
+Use `--export=ALL` when passing submission-shell settings. Set both TP and PP
+when choosing a layout. The batch job enforces `TP * PP == NUM_NODES`; the
+launcher also checks `TP * PP == NUM_NODES * visible GPUs per node`.
+
+These examples assume four one-GPU nodes and a shell without stale `SPEC_MODEL`
+or `SPEC_TOKENS` overrides. Speculative examples are configurations to validate
+on your installed build, not measured performance recommendations.
 
 ```bash
-TP_SIZE=1 PP_SIZE=4 SPEC_TP_SIZE=1 SPEC_METHOD=dflash \
-    sbatch dgxspark/slurm-vllm.sbatch
+# Four pipeline stages, no speculative decoding.
+TP_SIZE=1 PP_SIZE=4 SPEC_METHOD=none CONTEXT_PROFILE=128k \
+    sbatch "$DEPLOY_KIT_ROOT/dgxspark/slurm-vllm.sbatch"
+
+# N-gram uses no second model; this launcher requires PP=1 and the V1 runner.
+TP_SIZE=4 PP_SIZE=1 SPEC_METHOD=ngram VLLM_USE_V2_MODEL_RUNNER=0 \
+    CONTEXT_PROFILE=128k sbatch "$DEPLOY_KIT_ROOT/dgxspark/slurm-vllm.sbatch"
+
+# DFlash uses the second model-list entry, with draft TP=1.
+TP_SIZE=4 PP_SIZE=1 SPEC_METHOD=dflash SPEC_TP_SIZE=1 \
+    CONTEXT_PROFILE=128k sbatch "$DEPLOY_KIT_ROOT/dgxspark/slurm-vllm.sbatch"
 ```
 
-See the [draft parallel configuration](https://docs.vllm.ai/en/latest/api/vllm/config/speculative/)
-and [V2 model runner](https://docs.vllm.ai/en/latest/api/vllm/v1/worker/gpu/model_runner/).
+EAGLE3 requires `SPEC_METHOD=eagle3` and a compatible EAGLE3 checkpoint as the
+second entry (or an explicit `SPEC_MODEL`). Do not reuse the DFlash checkpoint
+with the EAGLE3 method. Token defaults are n-gram=4, DFlash=15, EAGLE3=3;
+`SPEC_TOKENS` overrides them. `none` rejects a leftover `SPEC_MODEL` or
+`SPEC_TOKENS`; n-gram rejects `SPEC_MODEL`, PP>1, and explicit V2 selection.
+
+For DFlash/EAGLE3 with target PP>1, the launcher requests Model Runner V2 and
+checks the installed build for all of the following before loading weights:
+
+- `Qwen3NextModel` advertises auxiliary hidden-state relay across pipeline stages.
+- Draft parallel configuration sets PP=1.
+- The V2 runner provides auxiliary-state relay validation.
+
+These checks are stricter than detecting a runner helper alone. A failed check
+stops startup with a suggestion to use `SPEC_METHOD=none` or PP=1 with TP equal
+to the total GPU count. Passing checks still requires a real inference test.
+The draft JSON sets `draft_tensor_parallel_size`; there is no `SPEC_PP_SIZE`
+launcher setting. MTP and DSpark remain outside the supported presets.
+
+### What vLLM 0.30.0 changes
+
+Source checked September 24, 2026 against the **v0.30.0 tag**:
+
+- The [release notes](https://github.com/vllm-project/vllm/releases/tag/v0.30.0)
+  announce Model Runner V2 PP support for EAGLE3/DFlash/DSpark and MTP.
+- [Draft configuration](https://github.com/vllm-project/vllm/blob/v0.30.0/vllm/config/speculative.py)
+  sets draft PP=1 independently of target PP. Separate target/draft PP is therefore
+  supported by the framework.
+- [Qwen3NextModel](https://github.com/vllm-project/vllm/blob/v0.30.0/vllm/model_executor/models/qwen3_next.py)
+  still returns only `hidden_states` and `residual` from intermediate PP stages.
+  It does not pack or collect the auxiliary states needed across those stages,
+  and inherits `supports_aux_hidden_states_over_pp=False` from
+  [EagleModelMixin](https://github.com/vllm-project/vllm/blob/v0.30.0/vllm/model_executor/models/interfaces.py).
+- The [V2 runtime validator](https://github.com/vllm-project/vllm/blob/v0.30.0/vllm/v1/worker/gpu/spec_decode/eagle/eagle3_utils.py)
+  rejects a target without that capability. `SupportsPP` plus `SupportsEagle3`
+  does not bypass this additional requirement.
+
+Consequently, stock v0.30.0 does **not** enable Qwen3-Coder-Next + DFlash/EAGLE3
+at TP=1/PP=4 or TP=2/PP=2. The launcher retains its installed-build check so a
+future implementation can pass without a hard-coded version block. Do not
+enable the capability flag alone: the forward path must implement the relay.
+Use TP=4/PP=1 to test drafting on four Sparks, and compare with non-speculative
+TP=1/PP=4 and TP=2/PP=2 baselines. These layouts require actual GPU benchmarks;
+framework support alone does not predict throughput.
+
+### Experimental local relay patch
+
+The repository includes a reversible, opt-in patch for **exactly vLLM 0.30.0**.
+It adds Qwen3Next auxiliary-state relay for a first DFlash experiment at target
+TP=1/PP=2 or 4, with draft TP=1/PP=1. See the
+[installation, launch, rollback, and GPU validation guide](../patches/qwen3next-pp/README.md).
+
+Install it with the serving environment's Python using
+`utility/qwen3next_pp_patch.py --apply`, once per distinct environment while
+jobs are stopped. The launcher only enables it with
+`TACC_QWEN3NEXT_PP_DFLASH=1`; it then checks the exact patched source and imported
+capability on every node. The prototype requires DFlash, target TP=1, eager
+execution, native context, and no HF overrides. Its patch ID is included in
+the configuration fingerprint. Other startup defaults are unchanged.
+
+CPU relay tests and simulated Slurm handoff pass. **This is not yet validated
+with real weights on the Sparks**: recurrent-state restoration, GPU kernels,
+and throughput still need the checks in the guide. It is a source patch, not
+HTTP middleware or a registered vLLM plugin.
+
+## Startup failures
+
+If `Worker_PP0` reports `GPUModelRunner` has no `drafter`, inspect the effective
+speculative method and runner in the node logs. The launcher rejects n-gram with
+PP>1 before model startup; setting draft TP=1 does not resolve that combination.
+Use the non-speculative baseline above to isolate it.
+
+A missing `ShmRingBuffer.shared_memory` is a different worker-communication
+failure. Find the earliest traceback across **all** node logs, before the NCCL
+abort and resource-tracker cleanup messages. This script does not patch vLLM's
+shared-memory implementation. `--enforce-eager` and longer startup timeouts do
+not establish that an unsupported PP/speculation combination can run.
+
+Validation in this checkout covers shell syntax and a simulated Slurm-to-launcher
+handoff. Run the regression checks without a GPU:
+
+```bash
+bash -n dgxspark/slurm-vllm.sbatch dgxspark/launch-vllm.sh
+python3 tests/check_slurm_handoff.py
+```
+
+Run from the repository root. If the system Bash is older than 4 (such as the
+macOS system Bash), prefix the Python command with
+`BASH_BIN=/opt/homebrew/bin/bash` or the path to another Bash 4+ installation.
+The checks simulate Slurm, GPU discovery, port binding and the final vLLM
+process; embedded configuration generation uses real Python. A real Slurm
+allocation is still needed to verify CUDA, networking, model capacity and
+inference on DGX Spark.

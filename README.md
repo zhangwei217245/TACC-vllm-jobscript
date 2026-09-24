@@ -1,18 +1,25 @@
-# Serve Qwen3-Coder-Next on DGX Spark with Slurm
+# vLLM serving on DGX Spark
 
-The batch script requests four nodes with one GPU per node and starts one
-launcher per node. vLLM uses tensor parallelism across the four GPUs; only the
-first allocated node runs the HTTP API and web UI.
+Launch Qwen3-Coder-Next-FP8 across four DGX Spark nodes through Slurm, with an
+OpenAI-compatible API and a browser chat UI on the first allocated node.
+The current baseline uses **TP=2, PP=2, speculative decoding off**. Each node
+runs one launcher with one visible GPU. Set both `TP_SIZE` and `PP_SIZE` to
+choose another topology; their product must equal the allocated GPU count.
 
-## Repository layout and path resolution
+See the [DGX Spark deployment guide](dgxspark/README.md) for the full setup,
+network configuration, overrides and troubleshooting. The launcher remains
+Qwen3-Coder-Next-specific: changing the model list does not automatically adapt
+RoPE scaling, tool parsing or speculative-decoding compatibility to another model.
+
+## Project layout
 
 ```text
 TACC-vllm-jobscript/
 ├── dgxspark/
 │   ├── slurm-vllm.sbatch
 │   └── launch-vllm.sh
-├── models/                 # downloaded checkpoints
-│   └── models.txt          # ordered model IDs
+├── models/
+│   └── models.txt          # first entry: primary; second: optional draft
 ├── utility/
 │   ├── installer.sh
 │   ├── inference-network.sh
@@ -22,226 +29,154 @@ TACC-vllm-jobscript/
 └── ui/chat.html
 ```
 
-`slurm-vllm.sbatch` sources `utility/inference-network.sh` on the first node to
-find `HEAD_IP` unless supplied. It then runs `launch-vllm.sh` on every node.
-Each launcher sources the helper to export local NCCL/Gloo network settings;
-the head also selects an HTTP bind address and port. Sourcing retains those
-exports for the vLLM process.
+The installer and downloader use the repository root regardless of the current
+working directory. Their destinations are `.venv/` and `models/`. The serving
+scripts default `PROJECT` to this root; overriding it selects another existing
+environment/model directory and does not redirect the installer or downloader.
+All nodes need the same absolute paths. The job log directory must be shared
+because it contains the generated host list.
 
-Both scripts default `NETWORK_SCRIPT` to
-`$DEPLOY_KIT_ROOT/utility/inference-network.sh`. The launcher derives the root
-from the parent of its own directory using `BASH_SOURCE[0]`, independently of
-its working directory. Slurm runs a spooled copy of the batch script, so that
-script instead finds the launcher from the submission directory (repository
-root or `dgxspark/`), or an explicit `DEPLOY_KIT_ROOT` or `LAUNCHER` override.
+## Install and download
 
-Use absolute paths for overrides. A relative `NETWORK_SCRIPT` is resolved
-against the caller's directory for direct launches, or `SLURM_SUBMIT_DIR` for
-batch launches. `--chdir` controls logs, not helper discovery. Both scripts check
-that the helper is readable; no copy or symlink into `dgxspark/` is needed.
-
-## 1. Prepare the environment
-
-Run these commands in Bash, replacing the checkout path:
+Run on Linux with GPU access according to your site's allocation policy:
 
 ```bash
 cd /absolute/path/to/TACC-vllm-jobscript
 export DEPLOY_KIT_ROOT="$PWD"
-export PROJECT="$DEPLOY_KIT_ROOT"
-bash "$DEPLOY_KIT_ROOT/utility/installer.sh"
+bash utility/installer.sh
+bash utility/download_model.sh
 ```
 
-Run the installer on a Linux DGX node with GPU access under your site's
-allocation policy. It currently defaults to Python 3.14 and vLLM 0.28.0,
-overridable through `PYTHON_VERSION` and `VLLM_VERSION`. It creates
-`$PROJECT/.venv` and `$PROJECT/models` and checks CUDA visibility.
+The installer currently defaults to Python **3.14** and vLLM **0.30.0**.
+`PYTHON_VERSION` and `VLLM_VERSION` override these values. An existing `.venv`
+with a different Python version is rejected rather than replaced.
 
-Keep the checkout, environment and model files available at the same absolute
-paths on every node. Install separately on each node if the environment is not
-shared. The log directory must be shared because every launcher reads the same
-generated `hosts.txt`. Nodes need Bash 4+, iproute2, working CUDA drivers and,
-for RDMA, exposed RDMA devices and drivers.
-
-The installer and downloader resolve the repository root from their own paths,
-so they work from any working directory and always use root `.venv/` and `models/`.
-The launchers default `PROJECT` to `DEPLOY_KIT_ROOT`; exporting it is optional.
-To serve from another existing environment and model directory, override `PROJECT`.
-This serving override does not change the installer or downloader destinations.
-
-## 2. Download the model
-
-Edit `models/models.txt`, with one Hugging Face `organization/model` ID per line:
+Edit [models/models.txt](models/models.txt) before downloading:
 
 ```text
 Qwen/Qwen3-Coder-Next-FP8
 z-lab/Qwen3-Coder-Next-DFlash
 ```
 
-The order of nonblank, non-comment entries defines their roles:
+Use one `organization/model` ID per line. Blank lines and full-line `#` comments
+are ignored. The first entry selects the primary model. The second selects the
+draft only when `SPEC_METHOD=dflash` or `eagle3`. Later entries are downloaded
+but not automatically served. Downloads are sequential and stop on failure.
+Every `/` becomes `--` in the local folder name.
 
-1. The first model is the primary model to serve.
-2. The second model is the auxiliary draft model for model-based speculative decoding.
-3. Additional models are downloaded but are not automatically selected for serving.
+For the example above, the primary folder is
+`models/Qwen--Qwen3-Coder-Next-FP8`, and the public model name is
+`Qwen3-Coder-Next-FP8` (the first `author--` prefix is stripped). The default
+`SPEC_METHOD=none` needs only the first entry. `ngram` also uses no draft model.
+A second entry alone never enables speculative decoding.
 
-Blank lines and full-line `#` comments do not count toward this order. Downloads
-run sequentially and stop on the first failure. Every `/` becomes `--` in the
-local folder name. For example, `Qwen/Qwen3-Coder-Next-FP8` is stored in
-`models/Qwen--Qwen3-Coder-Next-FP8`.
+The batch script reads `$PROJECT/models/models.txt`. `MODEL_LIST`, `MODEL_REPO`,
+`MODEL_NAME`, `MODEL_PATH`, `SPEC_MODEL` and `SERVED_MODEL_NAME` can override the
+selection. `MODEL_REPO` changes checkpoint storage, not the model-list location.
+For a custom download list, run `bash utility/download_model.sh /path/to/list.txt`.
+Direct launcher runs do not read the list; model overrides must be supplied explicitly.
 
-```bash
-bash "$DEPLOY_KIT_ROOT/utility/download_model.sh"
-# Or download a custom list:
-bash "$DEPLOY_KIT_ROOT/utility/download_model.sh" /path/to/models.txt
-```
+## Submit a baseline job
 
-The downloader uses repository-root `.venv/bin/hf`. If `hf` is missing, install
-it with `"$PROJECT/.venv/bin/python" -m pip install huggingface_hub`. For private
-or gated repositories, first run `"$PROJECT/.venv/bin/hf" auth login`.
-
-`slurm-vllm.sbatch` reads `$PROJECT/models/models.txt` by default. Set `MODEL_LIST`
-to use a custom file; relative paths resolve against `SLURM_SUBMIT_DIR`.
-It derives these defaults from the example above:
-
-```text
-MODEL_NAME=Qwen--Qwen3-Coder-Next-FP8
-MODEL_PATH=$PROJECT/models/Qwen--Qwen3-Coder-Next-FP8
-SPEC_MODEL=$PROJECT/models/z-lab--Qwen3-Coder-Next-DFlash
-SERVED_MODEL_NAME=Qwen3-Coder-Next-FP8
-```
-
-The launcher strips the first `author--` prefix from `MODEL_NAME` for the default
-API/UI `SERVED_MODEL_NAME`. Explicit `MODEL_NAME`, `MODEL_PATH`, `SPEC_MODEL`, and
-`SERVED_MODEL_NAME` overrides take precedence. `MODEL_REPO` overrides the checkpoint
-parent directory; it does not change the default list location.
-
-The batch script uses the second entry for `SPEC_METHOD=dflash` (the default) or
-`SPEC_METHOD=eagle3` (EAGLE3). Select the method explicitly to match the auxiliary
-checkpoint; the list does not infer it. These methods require a second entry
-unless `SPEC_MODEL` is explicitly supplied. `SPEC_METHOD=none` and `ngram` do not
-use the second entry and allow a one-model list. Do not export `SPEC_MODEL` for
-those methods. DSpark is not currently a supported launcher preset; this list
-change does not add a DSpark backend.
-
-Keep the complete downloaded checkpoints at the same paths on every node. The
-model list is tracked in Git; downloaded model folders and `.venv/` are ignored.
-
-## 3. Inspect networking and submit a preflight job
-
-Inspect the interfaces on each node:
+The batch defaults retain an experimental 1M context and eight concurrent
+sequences. Start with the smaller baseline below. Add your site's required
+account, partition and GPU request, such as `--gres=gpu:1` where configured.
 
 ```bash
-bash "$DEPLOY_KIT_ROOT/utility/inference-network.sh" --list
-```
-
-The default transport is `rdma`. For ambiguous selection, set `NET_IFACE` and,
-if needed, `NET_HCA` to the appropriate device names. For TCP, set
-`NET_TRANSPORT=socket`. Global interface overrides assume identical interface
-names across nodes; do not export a single node's `NET_LOCAL_IP` to every node.
-Normally leave `HEAD_IP` unset so the batch script discovers it on the first
-allocated host. `HTTP_IFACE` or `HTTP_CLIENT` can guide the separate HTTP
-interface selection.
-
-Start with 128K context, one sequence, no speculation and the auto weight
-loader. These explicit overrides avoid the batch script's experimental defaults
-of 1M context, eight sequences and DFlash with 15 draft tokens, and the
-launcher's `instanttensor` loader.
-
-```bash
-export CONTEXT_PROFILE=128k
-export MAX_NUM_SEQS=1
-export MAX_NUM_BATCHED_TOKENS=8192
-export SPEC_METHOD=none
-export LOAD_FORMAT=auto
-export SERVICE_PORT=8040
+export TP_SIZE=2 PP_SIZE=2 SPEC_METHOD=none
+unset SPEC_MODEL SPEC_TOKENS
+export CONTEXT_PROFILE=128k MAX_NUM_SEQS=1 MAX_NUM_BATCHED_TOKENS=8192
+export LOAD_FORMAT=auto SERVICE_PORT=8040
 mkdir -p "$DEPLOY_KIT_ROOT/logs"
 
-sbatch --export=ALL --time=01:00:00 \
-    --chdir="$DEPLOY_KIT_ROOT/logs" \
+# Allocate nodes, run preflight checks, and print commands without loading weights.
+sbatch --export=ALL --time=01:00:00 --chdir="$DEPLOY_KIT_ROOT/logs" \
     "$DEPLOY_KIT_ROOT/dgxspark/slurm-vllm.sbatch" --dry-run
-```
 
-Add your site's required `--account`, `--partition` and GPU request (for example,
-`--gres=gpu:1` where configured) to both submission commands. The script defaults
-to four nodes, one task per node and `--mem=0` (all schedulable host memory).
-It assumes one visible GPU per node. Overriding `--nodes` changes the default
-TP size; the model and memory capacity must support the resulting configuration.
-
-Dry-run still uses an allocation and checks CUDA, model configuration, network
-selection, UI imports and local port availability. It prints commands without
-loading weights or starting vLLM. It does not validate vLLM CLI support, model
-capacity, distributed communication or external reachability. Check that your
-installed build supports the printed options before a full run.
-
-## 4. Start serving and inspect logs
-
-Keep the exports above in the same shell, then submit without `--dry-run`:
-
-```bash
-sbatch --export=ALL --time=01:00:00 \
-    --chdir="$DEPLOY_KIT_ROOT/logs" \
+# Start serving with the same environment.
+sbatch --export=ALL --time=01:00:00 --chdir="$DEPLOY_KIT_ROOT/logs" \
     "$DEPLOY_KIT_ROOT/dgxspark/slurm-vllm.sbatch"
 ```
 
-Use the job ID printed by `sbatch`:
+Slurm selects the host order, discovers the head's engine IP, and invokes the
+launcher once on every node. The launcher reads the host list to determine its
+rank, activates `$PROJECT/.venv`, and starts vLLM. Rank 0 provides HTTP/UI;
+the remaining ranks use `--headless`. The executor is `mp`, with `srun --mpi=none`.
 
-```bash
-JOB_ID=12345                     # replace with your job ID
-squeue -j "$JOB_ID"
-tail -f "$DEPLOY_KIT_ROOT/logs/vllm-run-$JOB_ID.out"
-```
+Logs are in `logs/vllm-run-JOBID.out` and `logs/vllm-run-JOBID/node-HOSTNAME.log`.
+The head log prints the HTTP candidate and UI URL; wait for vLLM startup to finish.
+`HEAD_IP:8041` is the engine rendezvous endpoint, not the browser/API endpoint.
+`--chdir` controls the log location; without it, logs use the submission directory.
+Stop serving with `scancel JOBID`.
 
-| File | Contents |
-| --- | --- |
-| `logs/vllm-run-JOBID.out` | Batch diagnostics, head address and host order |
-| `logs/vllm-run-JOBID/hosts.txt` | Shared ordered allocation membership |
-| `logs/vllm-run-JOBID/node-HOSTNAME.log` | Each node's launcher and vLLM output |
+## Parallelism and speculation
 
-Read the first host's node log for `HTTP candidate:` and vLLM startup messages.
-The candidate is printed before vLLM is ready. `HEAD_IP:8041` is the engine
-rendezvous endpoint, not the HTTP API. Compare configuration fingerprints across
-node logs; there is no automatic remote consistency check.
+| Setting | Slurm default | Direct launcher default |
+| --- | --- | --- |
+| Primary TP / PP | 2 / 2 | 2 / 2 |
+| Speculative method | `none` | `none` |
+| Context | `1m` (1,048,576 tokens) | `1m` |
+| Maximum sequences | 8 | 1 above native context; 4 otherwise |
+| Batch token budget | 8192 | 4096 above native context; 8192 otherwise |
+| Weight loader | `instanttensor` | `instanttensor` |
+| UI | Enabled on rank 0 | Enabled on rank 0 |
 
-Without `--chdir`, logs go into the submission directory. When submitting from
-outside the checkout, retain the absolute `DEPLOY_KIT_ROOT` export above.
+For four one-GPU nodes, `TP_SIZE=1 PP_SIZE=4 SPEC_METHOD=none` is another explicit
+layout. A different node count requires explicit TP/PP values; defaults do not
+resize automatically. Exported submission settings take precedence.
 
-## 5. Test the API and open the UI
+The launcher restricts n-gram speculation to PP=1 and rejects an explicit V2
+runner for that preset. DFlash/EAGLE3 with PP>1 require an installed build with
+Qwen3Next auxiliary hidden-state relay, a compatible V2 runner and draft PP=1;
+the launcher checks these before loading weights. Changing the draft TP/PP alone
+does not satisfy those requirements. See the [speculation examples](dgxspark/README.md#primary-and-draft-parallelism).
+MTP and DSpark are not implemented as launcher presets.
 
-From the intended client, substitute the HTTP address printed in the head log:
+**vLLM 0.30.0 distinction (source checked September 24, 2026):** the
+[release adds PP speculation in Model Runner V2](https://github.com/vllm-project/vllm/releases/tag/v0.30.0),
+but the tagged Qwen3Next implementation still lacks auxiliary-state relay across
+PP stages. `SupportsPP` and `SupportsEagle3` individually do not establish support
+for their combination. For stock 0.30.0, use PP=1 for Qwen3-Coder-Next with
+DFlash/EAGLE3; see the [model-specific evidence](dgxspark/README.md#primary-and-draft-parallelism).
 
-```bash
-BASE_URL=http://192.168.1.10:8040   # replace with the reported HTTP endpoint
-curl --noproxy '*' "$BASE_URL/health"
-curl --noproxy '*' "$BASE_URL/v1/models"
-curl --noproxy '*' "$BASE_URL/v1/chat/completions" \
-    -H 'Content-Type: application/json' \
-    -d '{"model":"Qwen3-Coder-Next-FP8","messages":[{"role":"user","content":"Write a Python hello-world program."}],"max_tokens":128}'
-```
+An opt-in [Qwen3Next PP+DFlash prototype](patches/qwen3next-pp/README.md) now
+provides a reversible patch for exactly vLLM 0.30.0. It implements the missing
+relay for experimental TP=1/PP=2 or 4 runs. CPU tests and simulated handoff pass;
+real GPU correctness and performance remain unverified. It is disabled by
+default and requires explicit installation and `TACC_QWEN3NEXT_PP_DFLASH=1`.
 
-Open `<BASE_URL>/ui/` for the bundled chat page. It is enabled by default; export
-`VLLM_UI_ENABLE=0` before submission to disable it. Leave `VLLM_PUBLIC_BASE_URL`
-unset for browser same-origin requests, or set it to the browser-facing server
-root without `/v1` when using a proxy.
+## Browser chat UI
 
-If you export `VLLM_API_KEY` before submission, add
-`-H "Authorization: Bearer $VLLM_API_KEY"` to the API requests and configure your
-client with the key. A bindable port does not establish remote reachability:
-the client must have a route and permitted access to the HTTP address. Keep the
-service on a trusted network or behind your authenticated gateway.
+Open `<HTTP_BASE_URL>/ui/`. The page fetches `/ui/config.json` to prefill the
+API URL and served model name. By default it uses the browser's origin, including
+SSH tunnels and proxy prefixes. Set `VLLM_PUBLIC_BASE_URL` to a public server root
+without `/v1` to override this, or `VLLM_UI_ENABLE=0` to disable the UI.
 
-The allocation stays active while vLLM serves. Stop it with:
+The updated UI provides:
 
-```bash
-scancel "$JOB_ID"
-```
+- Streaming Markdown and a **Copy code** button attached to each code block.
+  A separate **Copy Markdown** button copies the whole response.
+- A live tok/s chart in each assistant response, retained after completion.
+- **Min, max, mean and median tok/s** at the end of each response, including
+  partial responses when stopped or interrupted.
+- Client-observed TTFT, output-token totals and an end-to-end average rate above
+  the conversation. These are distinct from the per-window chart rates.
 
-The site's time limit also stops serving. After validating the baseline, adjust
-context, concurrency, transport and speculation individually. Extended context
-and FP8/DFlash combinations have not been validated on DGX hardware by this
-update.
+Charts measure arrivals in one-second windows from first output, including
+reasoning and pauses; the final window may be shorter. Summary mean and median
+are computed across these window rates. Both final and continuous usage are
+requested by default. If the first output delta includes a positive server
+completion-token count, the chart uses server counts. Otherwise it remains an
+explicitly labeled characters-divided-by-four estimate for that response.
+Final-only usage can correct totals, but cannot reconstruct the live chart.
+Network buffering affects the measurements; these are not server-only decode rates.
 
-## Other scripts
+For APIs that reject stream options, disable both usage checkboxes. Code copying
+tries the Clipboard API, then a fallback for HTTP deployments, then manual
+selection if the browser refuses copying. No conversations, settings or API keys
+are saved by the page. When `VLLM_API_KEY` is configured, enter it in the UI or
+send `Authorization: Bearer ...` with API requests.
 
-`manual/run_vllm.sh` and `manual/stop_vllm.sh` are separate manual launch scripts;
-inspect their path and host settings before use. For the Slurm workflow above,
-stop with `scancel`. `mpi-smoke.c` and `mpi-smoke.sbatch` provide a separate MPI
-test; the serving job uses `srun --mpi=none`.
+The launcher accepts the public `VLLM_UI_*` settings and passes middleware values
+as `TACC_UI_*` / `TACC_PUBLIC_BASE_URL` to avoid vLLM unknown-variable warnings.
+The middleware also accepts legacy names, with `TACC_*` taking precedence.

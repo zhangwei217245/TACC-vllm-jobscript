@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Extracted from vLLM v0.30.0; see patches/qwen3next-pp/README.md.
+def relay_aux_hidden_states(
+        self,
+        intermediate_tensors: IntermediateTensors | None,
+        output_intermediate_tensors: IntermediateTensors,
+    ) -> IntermediateTensors:
+        if not self.aux_hidden_state_relay_keys:
+            return output_intermediate_tensors
+        assert intermediate_tensors is not None
+        return IntermediateTensors(
+            output_intermediate_tensors.tensors
+            | {
+                key: intermediate_tensors[key]
+                for key in self.aux_hidden_state_relay_keys
+            }
+        )

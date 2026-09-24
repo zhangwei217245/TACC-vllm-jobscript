@@ -1,0 +1,92 @@
+--- a/vllm/model_executor/models/qwen3_next.py
++++ b/vllm/model_executor/models/qwen3_next.py
+@@ -4,6 +4,8 @@
+ 
+ from collections.abc import Iterable
+ from itertools import islice
++
++import os
+ 
+ import torch
+ from torch import nn
+@@ -621,6 +623,11 @@
+ 
+ @support_torch_compile
+ class Qwen3NextModel(nn.Module, EagleModelMixin):
++    _tacc_pp_patch = "qwen3next-dflash-pp-v030-r1"
++    supports_aux_hidden_states_over_pp = (
++        os.environ.get("TACC_QWEN3NEXT_PP_DFLASH") == "1"
++    )
++
+     hf_to_vllm_mapper = WeightsMapper(
+         orig_to_new_stacked={
+             # weight_name: (param_name, shard_id)
+@@ -639,6 +646,21 @@
+ 
+         config: Qwen3NextConfig = vllm_config.model_config.hf_text_config
+         parallel_config = vllm_config.parallel_config
++        if self.supports_aux_hidden_states_over_pp:
++            spec = vllm_config.speculative_config
++            if (
++                config.model_type != "qwen3_next"
++                or parallel_config.tensor_parallel_size != 1
++                or parallel_config.pipeline_parallel_size not in (1, 2, 4)
++                or parallel_config.use_sequence_parallel_moe
++                or spec is None
++                or spec.method != "dflash"
++                or os.environ.get("VLLM_USE_V2_MODEL_RUNNER") != "1"
++            ):
++                raise RuntimeError(
++                    "Experimental Qwen3Next relay requires qwen3_next, "
++                    "DFlash, V2, TP=1, PP=1/2/4, and no sequence parallelism"
++                )
+ 
+         eplb_config = parallel_config.eplb_config
+         self.num_redundant_experts = eplb_config.num_redundant_experts
+@@ -708,7 +730,21 @@
+             hidden_states = sequence_parallel_chunk(hidden_states)
+             assert residual is None
+ 
+-        aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
++        relay_aux = (
++            self.supports_aux_hidden_states_over_pp
++            and get_pp_group().world_size > 1
++        )
++        if relay_aux and self.config.model_type != "qwen3_next":
++            raise RuntimeError("Experimental PP relay is scoped to qwen3_next")
++        remote_aux = (
++            self.collect_remote_aux_hidden_states(intermediate_tensors)
++            if relay_aux else []
++        )
++        # A boundary tap belongs to the preceding stage. Only stage 0
++        # captures the embedding tap; never duplicate it on later ranks.
++        aux_hidden_states = []
++        if not relay_aux or get_pp_group().is_first_rank:
++            self._maybe_add_hidden_state(aux_hidden_states, 0, hidden_states, residual)
+         for layer_idx, layer in enumerate(
+             islice(self.layers, self.start_layer, self.end_layer),
+             start=self.start_layer,
+@@ -724,7 +760,12 @@
+ 
+         if not get_pp_group().is_last_rank:
+             return IntermediateTensors(
+-                {"hidden_states": hidden_states, "residual": residual}
++                {
++                    "hidden_states": hidden_states,
++                    "residual": residual,
++                    **(self.pack_local_aux_hidden_states(aux_hidden_states)
++                       if relay_aux else {}),
++                }
+             )
+         hidden_states, _ = self.norm(hidden_states, residual)
+         if self.use_sequence_parallel:
+@@ -739,6 +780,9 @@
+             else:
+                 hidden_states = tensor_model_parallel_all_gather(hidden_states, 0)
+                 hidden_states = hidden_states[:full_num_tokens]
++        # V2 relays upstream slots through intermediate ranks; the final
++        # rank assembles the ordered features consumed by the drafter.
++        aux_hidden_states = remote_aux + aux_hidden_states
+         if aux_hidden_states:
+             return hidden_states, aux_hidden_states
+         return hidden_states

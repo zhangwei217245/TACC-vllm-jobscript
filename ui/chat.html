@@ -280,6 +280,82 @@ This software is provided by the copyright holders and contributors “as is” 
             padding: 0
         }
 
+        .code-block {
+            margin: 16px 0;
+            min-width: 0;
+            border: 1px solid var(--line);
+            border-radius: 8px;
+            overflow: hidden;
+            background: #080d13
+        }
+
+        .code-toolbar {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 12px;
+            padding: 7px 12px;
+            background: var(--panel);
+            color: var(--muted);
+            font: 12px/1.5 ui-monospace, monospace
+        }
+
+        .copy-code {
+            padding: 4px 10px;
+            font-size: 12px
+        }
+
+        .body .code-block pre {
+            margin: 0;
+            border: 0;
+            border-radius: 0
+        }
+
+        .throughput {
+            margin-top: 18px;
+            padding: 12px 14px;
+            border: 1px solid var(--line);
+            border-radius: 10px;
+            background: var(--panel);
+            font-size: 12px;
+            color: var(--muted)
+        }
+
+        .throughput-header {
+            display: flex;
+            justify-content: space-between;
+            gap: 12px;
+            flex-wrap: wrap
+        }
+
+        .throughput-current {
+            color: var(--accent);
+            font-variant-numeric: tabular-nums
+        }
+
+        .throughput svg {
+            display: block;
+            width: 100%;
+            height: 120px;
+            margin: 6px 0
+        }
+
+        .throughput-stats {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px 20px;
+            margin-top: 8px;
+            font-variant-numeric: tabular-nums
+        }
+
+        .throughput-stats strong {
+            color: #edf2f7
+        }
+
+        .throughput-stats[hidden] {
+            display: none
+        }
+
         .body blockquote {
             margin-left: 0;
             border-left: 3px solid var(--accent);
@@ -341,6 +417,7 @@ This software is provided by the copyright holders and contributors “as is” 
 
         .message-footer {
             display: flex;
+            flex-wrap: wrap;
             gap: 10px;
             align-items: center;
             margin-top: 14px;
@@ -450,7 +527,8 @@ This software is provided by the copyright holders and contributors “as is” 
                 <label for="max">Max output tokens</label><input id="max" type="number" min="1" step="1" value="20480">
                 <label class="checks"><input id="usage" type="checkbox" checked><span>Request final token
                         usage</span></label>
-                <label class="checks"><input id="continuous" type="checkbox"><span>vLLM continuous usage</span></label>
+                <label class="checks"><input id="continuous" type="checkbox" checked><span>vLLM continuous usage
+                        · live token counts</span></label>
                 <p class="small">If your API rejects stream_options, uncheck both usage options.</p>
                 <details>
                     <summary>Connection & metric notes</summary>
@@ -466,6 +544,12 @@ This software is provided by the copyright holders and contributors “as is” 
                     </p>
                     <p>Server usage replaces the estimate when available. Continuous usage is a vLLM extension. No
                         settings, keys, or conversations are saved by this page.</p>
+                    <p>Each response chart shows client-observed output arrival rate in one-second windows from
+                        first output, including reasoning and pauses. The final window may be shorter. Min, max,
+                        mean and median describe these window rates; mean is their arithmetic average.</p>
+                    <p>Charts use server counts when supplied with the first output delta; otherwise they use
+                        characters ÷ 4 throughout. Final-only usage updates the total above, but cannot reconstruct
+                        token arrival times. Network buffering can affect every chart.</p>
                 </details>
             </aside>
             <section>
@@ -702,9 +786,136 @@ Please report this to https://github.com/markedjs/marked.`, e) { let r = "<p>An 
                 const out = allowed.has(node.tagName) ? document.createElement(node.tagName.toLowerCase()) : fragment;
                 if (node.tagName === 'A') { const href = node.getAttribute('href') || ''; if (/^(https?:\/\/|mailto:)/i.test(href)) { out.setAttribute('href', href); out.setAttribute('target', '_blank'); out.setAttribute('rel', 'noopener noreferrer'); } }
                 if (node.tagName === 'OL' && /^\d+$/.test(node.getAttribute('start') || '')) out.setAttribute('start', node.getAttribute('start'));
+                if (node.tagName === 'CODE') {
+                    const language = (node.getAttribute('class') || '').match(/(?:^|\s)language-([\w+-]+)/);
+                    if (language) out.dataset.language = language[1];
+                }
                 for (const child of node.childNodes) out.append(safe(child)); return out;
             }
-            const result = document.createDocumentFragment(); for (const node of template.content.childNodes) result.append(safe(node)); target.replaceChildren(result);
+            const result = document.createDocumentFragment(); for (const node of template.content.childNodes) result.append(safe(node));
+            // Reuse buttons so their copy feedback survives streaming Markdown updates.
+            const buttons = [...target.querySelectorAll('.copy-code')];
+            const focused = buttons.indexOf(document.activeElement);
+            result.querySelectorAll('pre').forEach((pre, index) => {
+                const code = pre.querySelector('code'); if (!code) return;
+                const block = document.createElement('div'), toolbar = document.createElement('div'), label = document.createElement('span');
+                block.className = 'code-block'; toolbar.className = 'code-toolbar';
+                label.textContent = code.dataset.language || 'Code';
+                const copy = buttons[index] || document.createElement('button');
+                copy.type = 'button'; copy.className = 'copy-code';
+                if (!copy.textContent) copy.textContent = 'Copy code';
+                copy.setAttribute('aria-label', 'Copy ' + label.textContent + ' block');
+                toolbar.append(label, copy); pre.replaceWith(block); block.append(toolbar, pre);
+            });
+            target.replaceChildren(result);
+            if (focused >= 0) target.querySelectorAll('.copy-code')[focused]?.focus({ preventScroll: true });
+        }
+        async function copyText(text, button, selectTarget) {
+            const original = button.dataset.label || button.textContent;
+            button.dataset.label = original;
+            clearTimeout(button.copyTimer);
+            let copied = false;
+            try { await navigator.clipboard.writeText(text); copied = true; } catch { /* HTTP deployments may lack Clipboard API. */ }
+            if (!copied) {
+                const field = document.createElement('textarea'); field.value = text;
+                field.style.cssText = 'position:fixed;left:-9999px;top:0';
+                document.body.append(field); field.select();
+                try { copied = document.execCommand('copy'); } catch { /* Fall back to selecting the visible code. */ }
+                field.remove(); if (button.isConnected) button.focus({ preventScroll: true });
+            }
+            button.textContent = copied ? 'Copied!' : 'Select / copy manually';
+            if (!copied && selectTarget?.isConnected) {
+                const range = document.createRange(); range.selectNodeContents(selectTarget);
+                const selection = window.getSelection(); selection.removeAllRanges(); selection.addRange(range);
+            }
+            button.copyTimer = setTimeout(() => { button.textContent = original; }, 2000);
+        }
+        $('chat').addEventListener('click', event => {
+            const button = event.target.closest('.copy-code'); if (!button) return;
+            const code = button.closest('.code-block').querySelector('pre code');
+            void copyText(code.textContent, button, code);
+        });
+
+        // One-second arrival windows. Choose one token source at first output so a
+        // final usage correction cannot produce a fictitious spike in the chart.
+        class RateSeries {
+            constructor() { this.start = null; this.end = null; this.source = 'estimate'; this.count = 0; this.buckets = []; }
+            observe(now, text, reason, serverCount) {
+                const chars = Array.from(text).length + Array.from(reason).length;
+                const validCount = Number.isInteger(serverCount) && serverCount >= 0;
+                if (this.start === null) {
+                    if (!chars) return;
+                    this.start = now;
+                    if (validCount && serverCount > 0) this.source = 'server';
+                }
+                const count = this.source === 'server' ? (validCount ? Math.max(this.count, serverCount) : this.count) : this.count + chars / 4;
+                const index = Math.max(0, Math.ceil(((this.end ?? now) - this.start) / 1000) - 1);
+                this.buckets[index] = (this.buckets[index] || 0) + count - this.count;
+                this.count = count;
+            }
+            finish(now) { this.end ??= now; }
+            samples(now) {
+                if (this.start === null) return [];
+                const seconds = ((this.end ?? now) - this.start) / 1000;
+                if (seconds <= 0) return [];
+                return Array.from({ length: Math.ceil(seconds) }, (_, i) => {
+                    const duration = Math.min(1, seconds - i);
+                    return { time: i + duration, rate: (this.buckets[i] || 0) / duration };
+                });
+            }
+        }
+        function rateStats(samples) {
+            if (!samples.length) return null;
+            const values = samples.map(p => p.rate).sort((a, b) => a - b), middle = Math.floor(values.length / 2);
+            return { min: values[0], max: values[values.length - 1], mean: values.reduce((a, b) => a + b, 0) / values.length,
+                median: values.length % 2 ? values[middle] : (values[middle - 1] + values[middle]) / 2 };
+        }
+        function createRateChart(parent) {
+            const chart = document.createElement('div'); chart.className = 'throughput';
+            chart.innerHTML = `<div class="throughput-header"><span>Output speed · tok/s</span><span class="throughput-current">Waiting for output…</span></div>
+                <svg viewBox="0 0 600 120" role="img" aria-label="Output speed chart: waiting for output">
+                    <path d="M52 10H588 M52 82H588" stroke="var(--line)" fill="none"/>
+                    <polygon class="rate-area" fill="var(--accent)" opacity=".1"/>
+                    <polyline class="rate-line" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linejoin="round"/>
+                    <text class="rate-top" x="44" y="18" text-anchor="end" fill="currentColor" font-size="11">—</text>
+                    <text x="44" y="86" text-anchor="end" fill="currentColor" font-size="11">0</text>
+                    <text x="52" y="108" fill="currentColor" font-size="11">0 s</text>
+                    <text class="rate-time" x="588" y="108" text-anchor="end" fill="currentColor" font-size="11">Since first output</text>
+                </svg><div class="rate-note">One-second windows · client-observed arrivals</div><div class="throughput-stats" hidden></div>`;
+            parent.append(chart); return chart;
+        }
+        function paintRateChart(s) {
+            const chart = s.chart, series = s.rateSeries, samples = series.samples(performance.now());
+            if (!samples.length) {
+                if (s.end !== null) {
+                    chart.querySelector('.throughput-current').textContent = 'No rate samples';
+                    chart.querySelector('svg').setAttribute('aria-label', 'Output speed chart: no rate samples');
+                    chart.querySelector('.rate-note').textContent = 'Min / max / mean / median: unavailable';
+                }
+                return;
+            }
+            const stats = rateStats(samples), last = samples[samples.length - 1], scale = Math.max(1, stats.max);
+            const approx = series.source === 'estimate' ? '≈' : '';
+            chart.querySelector('.throughput-current').textContent = `${s.end === null ? 'Live' : 'Last window'} ${approx}${last.rate.toFixed(1)} tok/s`;
+            // Bound SVG size for long replies; statistics still use every window.
+            const stride = Math.max(1, Math.ceil(samples.length / 600));
+            const visible = samples.filter((_, i) => i % stride === 0 || i === samples.length - 1);
+            const point = p => `${(52 + p.time / last.time * 536).toFixed(2)},${(82 - p.rate / scale * 72).toFixed(2)}`;
+            const points = `52,${(82 - samples[0].rate / scale * 72).toFixed(2)} ` + visible.map(point).join(' ');
+            chart.querySelector('.rate-line').setAttribute('points', points);
+            chart.querySelector('.rate-area').setAttribute('points', `52,82 ${points} 588,82`);
+            chart.querySelector('.rate-top').textContent = scale.toFixed(1);
+            chart.querySelector('.rate-time').textContent = last.time.toFixed(1) + ' s since first output';
+            chart.querySelector('svg').setAttribute('aria-label', `Output speed over ${last.time.toFixed(1)} seconds. Minimum ${approx}${stats.min.toFixed(1)}, maximum ${approx}${stats.max.toFixed(1)} tokens per second.`);
+            chart.querySelector('.rate-note').textContent = `${series.source === 'server' ? 'Server token counts' : 'Estimated tokens · characters ÷ 4'} · client arrival timing · 1 s windows (last may be shorter)`;
+            if (s.end !== null) {
+                const summary = chart.querySelector('.throughput-stats'); summary.hidden = false;
+                summary.replaceChildren(...Object.entries(stats).map(([name, value]) => {
+                    const item = document.createElement('span'), number = document.createElement('strong');
+                    number.textContent = approx + value.toFixed(1);
+                    item.append(name[0].toUpperCase() + name.slice(1) + ' ', number, ' tok/s'); return item;
+                }));
+            }
         }
         function endpoint() { const url = new URL($('base').value.trim()); if (!['http:', 'https:'].includes(url.protocol)) throw Error('Use an http:// or https:// API URL.'); return url.href.replace(/\/+$/, ''); }
         function headers() { const h = { 'Content-Type': 'application/json' }; if ($('key').value.trim()) h.Authorization = 'Bearer ' + $('key').value.trim(); return h; }
@@ -715,7 +926,7 @@ Please report this to https://github.com/markedjs/marked.`, e) { let r = "<p>An 
             $('tokens').textContent = approx + count.toLocaleString(); $('rate').textContent = count && elapsed > 0 ? approx + (count / elapsed).toFixed(1) : '—';
             $('metricNote').textContent = `${elapsed.toFixed(1)} s elapsed · ${s.usage === null ? 'Estimated tokens (characters ÷ 4)' : 'Server-reported tokens'}${s.first === null && !s.end ? ' · Waiting for first output' : ''}${s.promptTokens !== null ? ' · ' + s.promptTokens + ' prompt tokens' : ''}`;
         }
-        function paint(s) { const follow = $('chat').scrollHeight - $('chat').scrollTop - $('chat').clientHeight < 90; if (s.dirty) { renderMarkdown(s.text, s.card.body); s.reasonBody.textContent = s.reason; s.details.hidden = !s.reason; s.dirty = false; } metrics(s); if (follow) $('chat').scrollTop = $('chat').scrollHeight; }
+        function paint(s) { const follow = $('chat').scrollHeight - $('chat').scrollTop - $('chat').clientHeight < 90; if (s.dirty) { renderMarkdown(s.text, s.card.body); s.reasonBody.textContent = s.reason; s.details.hidden = !s.reason; s.dirty = false; } metrics(s); paintRateChart(s); if (follow) $('chat').scrollTop = $('chat').scrollHeight; }
         // Incremental SSE framing handles arbitrary UTF-8/network splits and CR/LF/CRLF.
         class SSEParser { constructor(onEvent) { this.onEvent = onEvent; this.line = ''; this.data = []; this.cr = false; } emit() { if (this.data.length) this.onEvent(this.data.join('\n')); this.data = []; } newline() { if (this.line === '') this.emit(); else if (this.line.startsWith('data:')) this.data.push(this.line.slice(5).replace(/^ /, '')); this.line = ''; } feed(text) { for (const ch of text) { if (this.cr) { this.cr = false; if (ch === '\n') continue; } if (ch === '\r') { this.newline(); this.cr = true; } else if (ch === '\n') this.newline(); else this.line += ch; } } finish() { if (this.line) this.newline(); this.emit(); } }
         function busy(value) { for (const id of ['send', 'clear', 'base', 'model', 'key', 'system', 'max', 'usage', 'continuous', 'load']) $(id).disabled = value; $('stop').hidden = !value; }
@@ -729,19 +940,20 @@ Please report this to https://github.com/markedjs/marked.`, e) { let r = "<p>An 
             $('error').textContent = ''; const next = [...history, { role: 'user', content }]; const payload = { model: $('model').value.trim(), messages: [$('system').value.trim() ? { role: 'system', content: $('system').value.trim() } : null, ...next].filter(Boolean), stream: true, max_tokens: Number($('max').value) };
             if ($('usage').checked || $('continuous').checked) { payload.stream_options = { include_usage: true }; if ($('continuous').checked) payload.stream_options.continuous_usage_stats = true; }
             card('You').body.textContent = content; const reply = card('Assistant'); const details = document.createElement('details'), summary = document.createElement('summary'), reasonBody = document.createElement('div'); summary.textContent = 'Reasoning'; reasonBody.className = 'reasoning'; details.append(summary, reasonBody); details.hidden = true; reply.el.insertBefore(details, reply.body);
-            const s = { start: performance.now(), end: null, first: null, text: '', reason: '', usage: null, promptTokens: null, card: reply, details, reasonBody, dirty: false, controller: new AbortController(), done: false, finished: false }; active = s; busy(true); $('status').textContent = 'Connecting…'; $('prompt').value = ''; const timer = setInterval(() => paint(s), 80); let success = false;
+            const s = { start: performance.now(), end: null, first: null, text: '', reason: '', usage: null, promptTokens: null, card: reply, details, reasonBody, chart: createRateChart(reply.el), rateSeries: new RateSeries(), dirty: false, controller: new AbortController(), done: false, finished: false }; active = s; busy(true); paint(s); $('status').textContent = 'Connecting…'; $('prompt').value = ''; const timer = setInterval(() => paint(s), 80); let success = false;
             try {
                 const r = await fetch(url + '/chat/completions', { method: 'POST', headers: headers(), body: JSON.stringify(payload), signal: s.controller.signal });
                 if (!r.ok) throw Error('HTTP ' + r.status + ': ' + (await r.text()).slice(0, 4000)); if (!r.body) throw Error('This response has no readable stream.'); if (!(r.headers.get('content-type') || '').includes('text/event-stream')) throw Error('Expected text/event-stream. The endpoint did not return an SSE stream.'); $('status').textContent = 'Streaming…';
                 const parser = new SSEParser(data => {
-                    if (s.done) return; if (data.trim() === '[DONE]') { s.done = true; return; } const j = JSON.parse(data); if (j.error) throw Error(typeof j.error === 'string' ? j.error : j.error.message || JSON.stringify(j.error)); const c = j.choices?.find(c => c.index === 0) ?? j.choices?.[0]; const d = c?.delta || {}; const text = typeof d.content === 'string' ? d.content : ''; const reason = typeof d.reasoning_content === 'string' ? d.reasoning_content : typeof d.reasoning === 'string' ? d.reasoning : ''; if (text || reason) { if (s.first === null) s.first = performance.now(); s.text += text; s.reason += reason; s.dirty = true; }
-                    if (c?.finish_reason) { s.finished = true; s.finishReason = c.finish_reason; }
+                    if (s.done) return; if (data.trim() === '[DONE]') { s.done = true; s.rateSeries.finish(performance.now()); return; } const j = JSON.parse(data); if (j.error) throw Error(typeof j.error === 'string' ? j.error : j.error.message || JSON.stringify(j.error)); const c = j.choices?.find(c => c.index === 0) ?? j.choices?.[0]; const d = c?.delta || {}; const text = typeof d.content === 'string' ? d.content : ''; const reason = typeof d.reasoning_content === 'string' ? d.reasoning_content : typeof d.reasoning === 'string' ? d.reasoning : ''; if (text || reason) { if (s.first === null) s.first = performance.now(); s.text += text; s.reason += reason; s.dirty = true; }
+                    s.rateSeries.observe(performance.now(), text, reason, j.usage?.completion_tokens);
+                    if (c?.finish_reason) { s.finished = true; s.finishReason = c.finish_reason; s.rateSeries.finish(performance.now()); }
                     if (Number.isFinite(j.usage?.completion_tokens) && j.usage.completion_tokens >= 0) s.usage = j.usage.completion_tokens; if (Number.isFinite(j.usage?.prompt_tokens)) s.promptTokens = j.usage.prompt_tokens;
                 });
                 const reader = r.body.getReader(), decoder = new TextDecoder(); try { while (!s.done) { const chunk = await reader.read(); if (chunk.done) { parser.feed(decoder.decode()); parser.finish(); break; } parser.feed(decoder.decode(chunk.value, { stream: true })); } } finally { await reader.cancel().catch(() => { }); reader.releaseLock(); }
                 if (!s.done && !s.finished) throw Error('Stream ended without a completion marker. The response may be incomplete.'); if (!s.text && !s.reason) throw Error('No text or reasoning output was returned.'); success = true; history = [...next, { role: 'assistant', content: s.text }]; $('status').textContent = s.finishReason === 'length' ? 'Finished · output token limit reached' : 'Finished';
             } catch (e) { $('status').textContent = e.name === 'AbortError' ? 'Stopped · partial reply excluded from history' : 'Request failed · reply excluded from history'; if (e.name !== 'AbortError') $('error').textContent = e.message + (e instanceof TypeError ? '\nCheck server reachability, CORS, and whether an HTTPS page is calling an HTTP API.' : ''); if (!$('prompt').value) $('prompt').value = content; }
-            finally { s.end = performance.now(); clearInterval(timer); paint(s); const footer = document.createElement('div'); footer.className = 'message-footer'; const copy = document.createElement('button'); copy.type = 'button'; copy.textContent = 'Copy Markdown'; copy.onclick = async () => { try { await navigator.clipboard.writeText(s.text); copy.textContent = 'Copied'; } catch { copy.textContent = 'Select text to copy'; } }; const note = document.createElement('span'); note.textContent = (success ? 'Complete' : 'Partial / failed') + ' · ' + $('metricNote').textContent; footer.append(copy, note); reply.el.append(footer); active = null; busy(false); $('prompt').focus(); }
+            finally { s.end = performance.now(); s.rateSeries.finish(s.end); clearInterval(timer); paint(s); const footer = document.createElement('div'); footer.className = 'message-footer'; const copy = document.createElement('button'); copy.type = 'button'; copy.textContent = 'Copy Markdown'; copy.onclick = () => copyText(s.text, copy, reply.body); const note = document.createElement('span'); note.textContent = (success ? 'Complete' : 'Partial / failed') + ' · ' + $('metricNote').textContent; footer.append(copy, note); reply.el.append(footer); active = null; busy(false); $('prompt').focus(); }
         };
     </script>
 </body>

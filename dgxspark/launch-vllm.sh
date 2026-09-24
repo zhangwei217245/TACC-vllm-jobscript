@@ -8,7 +8,8 @@
 #
 # Defaults retained: local model name, HEAD_IP=192.168.1.1,
 # MASTER_PORT=8041, HTTP range 8040-8050, RDMA, instanttensor, memory fraction .75.
-# Defaults changed: TP uses local GPUs, PP spans nodes; 1M context uses YaRN; max sequences=1.
+# Defaults: TP=2, PP=2 (four GPU ranks); 1M context uses YaRN; max sequences=1.
+# Four one-GPU nodes: TP spans pairs of nodes; PP has two stages.
 # 1M is experimental extension of the native 256K window, not a quality guarantee.
 # Use CONTEXT_PROFILE=128k or 256k for ordinary coding without RoPE scaling.
 #
@@ -19,13 +20,13 @@
 #   CONTEXT_PROFILE=512k bash launch-vllm.sh
 #   CONTEXT_PROFILE=1m KV_CACHE_DTYPE=fp8 bash launch-vllm.sh
 #   NET_TRANSPORT=socket TP_SIZE=4 PP_SIZE=1 bash launch-vllm.sh
-#   CONTEXT_PROFILE=128k SPEC_METHOD=ngram bash launch-vllm.sh
+#   TP_SIZE=4 PP_SIZE=1 CONTEXT_PROFILE=128k SPEC_METHOD=ngram bash launch-vllm.sh
 # Download a complete draft checkpoint once into shared storage (or on each node):
 #   hf download z-lab/Qwen3-Coder-Next-DFlash \
 #     --local-dir "$PROJECT/models/Qwen3-Coder-Next-DFlash"
 # Downloading locally does not establish FP8/GB10 compatibility.
 # Use the same absolute directory on every node:
-#   CONTEXT_PROFILE=128k SPEC_METHOD=dflash \
+#   TP_SIZE=4 PP_SIZE=1 CONTEXT_PROFILE=128k SPEC_METHOD=dflash \
 #     SPEC_MODEL="$PROJECT/models/Qwen3-Coder-Next-DFlash" \
 #     bash launch-vllm.sh
 #   export VLLM_API_KEY='private-key'  # optional; never printed by this launcher
@@ -39,7 +40,9 @@
 # Generate hosts.txt ONCE per Slurm allocation; distribute the same ordering:
 #   scontrol show hostnames "$SLURM_JOB_NODELIST" > hosts.txt
 #
-# Docs checked 2026-09-23 (no GPU validation of this launcher):
+# Reviewed 2026-09-24 against current upstream source; no GPU validation.
+# PP + model-based speculation also requires model-specific auxiliary-state relay.
+# Qwen3NextModel currently lacks that relay; the installed-build preflight checks it.
 # https://huggingface.co/Qwen/Qwen3-Coder-Next
 # https://docs.vllm.ai/en/v0.29.0/serving/parallelism_scaling/
 # https://docs.vllm.ai/en/latest/features/context_extension/
@@ -86,8 +89,8 @@ Context and performance:
   MAX_NUM_BATCHED_TOKENS              (default 4096 extended, otherwise 8192)
   BATCH_TOKENS                        (fallback alias for the setting above)
   GPU_MEM_UTILIZATION=0.75 DTYPE=auto KV_CACHE_DTYPE=auto LOAD_FORMAT=instanttensor
-  TP_SIZE                            (default visible GPUs per node)
-  PP_SIZE                            (default number of nodes)
+  TP_SIZE=2 PP_SIZE=2                 (four GPU ranks; environment overrides allowed)
+  TP_SIZE * PP_SIZE must equal NUM_NODES * visible GPUs per node.
   PREFIX_CACHING=1 CHUNKED_PREFILL=1 ENFORCE_EAGER=0
   ATTENTION_BACKEND MOE_BACKEND MAMBA_CACHE_MODE (optional; retain auto selection)
   HF_OVERRIDES                       (optional JSON object, merged over auto YaRN)
@@ -116,7 +119,9 @@ Static web UI (optional, head only):
 
 Speculative decoding (default off):
   SPEC_METHOD=none|ngram|dflash|eagle3
-  SPEC_TP_SIZE=1                     (draft TP; draft PP is fixed to 1 by vLLM)
+  SPEC_TP_SIZE=1                     (draft TP; model-based methods only)
+  TACC_QWEN3NEXT_PP_DFLASH=0          (opt-in experimental v0.30.0 source patch;
+    apply utility/qwen3next_pp_patch.py first on every node; see patches/qwen3next-pp)
   SPEC_TOKENS                        (defaults: ngram=4, dflash=15, eagle3=3)
   SPEC_MODEL                         (Hugging Face ID or absolute local draft directory)
   NGRAM_MIN=2 NGRAM_MAX=5
@@ -125,6 +130,12 @@ Speculative decoding (default off):
   EAGLE3: togethercomputer/Aurora-Spec-Qwen3-Coder-Next-FP8 (experimental in vLLM;
     checkpoint author documents SGLang). Drafter context may be shorter than target.
   MTP/DSpark are not presets: no matching native MTP/DSpark checkpoint verified.
+  DFlash/EAGLE3 with PP>1: requires Model Runner V2, draft PP=1, and Qwen3Next
+  auxiliary-state relay support. Checked in the installed build before loading.
+  Stock v0.30.0 Qwen3Next lacks that relay. The opt-in prototype requires
+  TP=1, PP=2/4, draft TP=1, DFlash, native context, and eager execution.
+  Otherwise use SPEC_METHOD=none for TP=2/PP=2, or TP=4/PP=1 for drafting.
+  N-gram is not implemented in the checked V2 runner; this preset uses PP=1.
 
 Existing network helper options (forwarded unchanged):
   NET_TRANSPORT=rdma|auto|socket NET_DEBUG=1 NET_IFACE NET_HCA NET_LOCAL_IP
@@ -161,6 +172,10 @@ done
 PROJECT=${PROJECT:-$DEPLOY_KIT_ROOT}
 [[ -d $PROJECT ]] || die "Project directory missing: $PROJECT"
 PROJECT=$(cd -- "$PROJECT" && pwd)
+TACC_QWEN3NEXT_PP_DFLASH=${TACC_QWEN3NEXT_PP_DFLASH:-0}
+boolean TACC_QWEN3NEXT_PP_DFLASH
+export TACC_QWEN3NEXT_PP_DFLASH
+QWEN3NEXT_PATCH_ID=disabled
 NETWORK_SCRIPT=${NETWORK_SCRIPT:-$DEPLOY_KIT_ROOT/utility/inference-network.sh}
 HOSTFILE=${HOSTFILE:-$LAUNCH_DIR/hosts.txt}
 MODEL_NAME=${MODEL_NAME:-Qwen--Qwen3-Coder-Next-FP8}
@@ -239,17 +254,17 @@ if pathlib.Path(static_ui.__file__).resolve() != pathlib.Path(sys.argv[1]).resol
 static_ui.StaticUIMiddleware(app=None)  # Checks dependencies and static directory.
 PY
 fi
-# Retain legacy launcher inputs as shell variables, but do not send them to vLLM.
+# Retain legacy launcher inputs as shell variables, but do not export them to vLLM.
 export -n VLLM_UI_ENABLE VLLM_UI_MODEL VLLM_UI_DIR VLLM_UI_PAGE \
-    VLLM_PUBLIC_BASE_URL VLLM_MIDDLEWARE_DIR
+VLLM_PUBLIC_BASE_URL VLLM_MIDDLEWARE_DIR
 NUM_GPUS=$("$PYTHON" -c 'import torch; print(torch.cuda.device_count())')
 positive_int NUM_GPUS
-TP_SIZE=${TP_SIZE:-$NUM_GPUS}
-PP_SIZE=${PP_SIZE:-$NUM_NODES}
+TP_SIZE=${TP_SIZE:-2}  # Tensor shards per pipeline stage.
+PP_SIZE=${PP_SIZE:-2}  # Pipeline stages; TP=2/PP=2 needs four GPU ranks.
 positive_int TP_SIZE
 positive_int PP_SIZE
 (( TP_SIZE * PP_SIZE == NUM_NODES * NUM_GPUS )) ||
-die 'TP_SIZE * PP_SIZE must equal NUM_NODES * visible GPUs/node.'
+die "TP_SIZE=$TP_SIZE * PP_SIZE=$PP_SIZE must equal NUM_NODES=$NUM_NODES * visible GPUs/node=$NUM_GPUS."
 
 # Explicit MAX_MODEL_LEN overrides the preset. Auto YaRN is based on this final length.
 CONTEXT_PROFILE=${CONTEXT_PROFILE:-1m}
@@ -268,7 +283,7 @@ KV_CACHE_DTYPE=${KV_CACHE_DTYPE:-auto}
 LOAD_FORMAT=${LOAD_FORMAT:-instanttensor}
 PREFIX_CACHING=${PREFIX_CACHING:-1}
 CHUNKED_PREFILL=${CHUNKED_PREFILL:-1}
-ENFORCE_EAGER=${ENFORCE_EAGER:-0}
+ENFORCE_EAGER=${ENFORCE_EAGER:-$TACC_QWEN3NEXT_PP_DFLASH}
 ENABLE_AUTO_TOOL_CHOICE=${ENABLE_AUTO_TOOL_CHOICE:-1}
 PROMPT_TOKENS_DETAILS=${PROMPT_TOKENS_DETAILS:-1}
 TOOL_CALL_PARSER=${TOOL_CALL_PARSER:-qwen3_coder}
@@ -344,8 +359,7 @@ HF_CONFIG=${config_lines[1]}
 GENERATION_CONFIG=${config_lines[2]}
 MODEL_CONFIG_SHA=${config_lines[3]}
 if (( MAX_MODEL_LEN > NATIVE_CONTEXT )); then
-    # Some vLLM/config versions still enforce the native limit with YaRN overrides.
-    # This permits the requested length; it does not implement RoPE scaling itself.
+    # Permit the extended limit; HF_CONFIG supplies the actual YaRN scaling.
     export VLLM_ALLOW_LONG_MAX_MODEL_LEN=${VLLM_ALLOW_LONG_MAX_MODEL_LEN:-1}
     boolean VLLM_ALLOW_LONG_MAX_MODEL_LEN
     default_seqs=1; default_batch=4096
@@ -364,12 +378,26 @@ fi
 
 # Exactly one speculative method. Native MTP/DSpark support is not assumed.
 SPEC_METHOD=${SPEC_METHOD:-none}
+if (( TACC_QWEN3NEXT_PP_DFLASH )); then
+    [[ $SPEC_METHOD == dflash ]] || die 'Experimental relay requires SPEC_METHOD=dflash.'
+    (( TP_SIZE == 1 && (PP_SIZE == 2 || PP_SIZE == 4) )) ||
+        die 'Experimental relay requires TP_SIZE=1 and PP_SIZE=2 or 4.'
+    (( ENFORCE_EAGER == 1 )) || die 'Experimental relay currently requires ENFORCE_EAGER=1.'
+    (( MAX_MODEL_LEN <= NATIVE_CONTEXT )) && [[ $HF_CONFIG == '{}' ]] ||
+        die 'Experimental relay requires native context and no HF_OVERRIDES; start with CONTEXT_PROFILE=128k.'
+    "$PYTHON" "$DEPLOY_KIT_ROOT/utility/qwen3next_pp_patch.py" --check >&2 ||
+        die 'Install the pinned relay patch in this serving environment before enabling it.'
+    QWEN3NEXT_PATCH_ID=qwen3next-dflash-pp-v030-r1
+    warn "EXPERIMENTAL $QWEN3NEXT_PATCH_ID: GPU correctness and throughput remain unverified."
+fi
 SPEC_CONFIG=
 case $SPEC_METHOD in
     none) [[ -z ${SPEC_MODEL:-} && -z ${SPEC_TOKENS:-} ]] || die 'SPEC_MODEL/TOKENS require a speculative method.' ;;
     ngram|dflash|eagle3)
         case $SPEC_METHOD in
             ngram)
+                (( PP_SIZE == 1 )) || die 'N-gram preset requires PP_SIZE=1; PP/V2 support is not established.'
+                [[ ${VLLM_USE_V2_MODEL_RUNNER:-0} != 1 ]] || die 'N-gram is not supported by the checked Model Runner V2.'
                 [[ -z ${SPEC_MODEL:-} ]] || die 'N-gram drafting does not use SPEC_MODEL.'
                 SPEC_TOKENS=${SPEC_TOKENS:-4}; SPEC_MODEL= ;;
             dflash)
@@ -386,6 +414,10 @@ case $SPEC_METHOD in
         if [[ $SPEC_METHOD != ngram ]]; then
             (( SPEC_TP_SIZE == 1 || SPEC_TP_SIZE == TP_SIZE )) ||
                 die 'SPEC_TP_SIZE must be 1 or match target TP_SIZE.'
+            case $SPEC_MODEL in
+                /*) [[ -r $SPEC_MODEL/config.json ]] || die "Draft config missing: $SPEC_MODEL/config.json" ;;
+                ./*|../*|\~*) die 'Use an absolute local SPEC_MODEL path, or a Hugging Face repository ID.' ;;
+            esac
             if (( PP_SIZE > 1 )); then
                 export VLLM_USE_V2_MODEL_RUNNER=${VLLM_USE_V2_MODEL_RUNNER:-1}
                 [[ $VLLM_USE_V2_MODEL_RUNNER == 1 ]] ||
@@ -396,9 +428,9 @@ case $SPEC_METHOD in
         NGRAM_MIN=${NGRAM_MIN:-2}; NGRAM_MAX=${NGRAM_MAX:-5}
         positive_int NGRAM_MIN; positive_int NGRAM_MAX
         (( NGRAM_MIN <= NGRAM_MAX )) || die 'NGRAM_MIN must not exceed NGRAM_MAX.'
-        SPEC_CONFIG=$("$PYTHON" - "$SPEC_METHOD" "$SPEC_TOKENS" "$SPEC_MODEL" "$NGRAM_MIN" "$NGRAM_MAX" "$SPEC_TP_SIZE" "$TP_SIZE" "$PP_SIZE" <<'PY'
-import json, sys
-method, tokens, model, low, high, draft_tp, target_tp, target_pp = sys.argv[1:]
+        SPEC_CONFIG=$("$PYTHON" - "$SPEC_METHOD" "$SPEC_TOKENS" "$SPEC_MODEL" "$NGRAM_MIN" "$NGRAM_MAX" "$SPEC_TP_SIZE" "$TP_SIZE" "$PP_SIZE" "$NUM_NODES" "$MODEL_PATH" <<'PY'
+import contextlib, json, sys
+method, tokens, model, low, high, draft_tp, target_tp, target_pp, nodes, target_path = sys.argv[1:]
 config = dict(method=method, num_speculative_tokens=int(tokens))
 if method == 'ngram':
     config.update(prompt_lookup_min=int(low), prompt_lookup_max=int(high))
@@ -406,28 +438,41 @@ else:
     config['model'] = model
     config['draft_tensor_parallel_size'] = int(draft_tp)
     if int(target_pp) > 1:
-        # Check the installed API, not a guessed minimum version. No weights loaded.
+        # No weights instantiated. Send import/config logs to stderr so the shell
+        # captures exactly one JSON document, even if vLLM logs to stdout.
         try:
-            from vllm.config import ParallelConfig, SpeculativeConfig
-            from vllm.v1.worker.gpu import model_runner
-            target = ParallelConfig(tensor_parallel_size=int(target_tp),
-                                    pipeline_parallel_size=int(target_pp),
-                                    distributed_executor_backend='mp')
-            draft = SpeculativeConfig.create_draft_parallel_config(target, int(draft_tp))
-            if draft.pipeline_parallel_size != 1:
-                raise RuntimeError('this build inherits target PP for the draft')
-            if not callable(getattr(model_runner, 'verify_supports_aux_hidden_states_over_pp', None)):
-                raise RuntimeError('Model Runner V2 lacks auxiliary hidden-state relay validation')
+            with contextlib.redirect_stdout(sys.stderr):
+                from vllm.config import ParallelConfig, SpeculativeConfig
+                from vllm.v1.worker.gpu import model_runner
+                from vllm.model_executor.models.qwen3_next import Qwen3NextModel
+                import os
+                if os.environ.get('TACC_QWEN3NEXT_PP_DFLASH') == '1':
+                    if getattr(Qwen3NextModel, '_tacc_pp_patch', None) != 'qwen3next-dflash-pp-v030-r1':
+                        raise RuntimeError('experimental patch was not loaded by this Python process')
+                    with open(os.path.join(target_path, 'config.json')) as f:
+                        if json.load(f).get('model_type') != 'qwen3_next':
+                            raise RuntimeError('experimental relay only supports model_type=qwen3_next')
+                if not getattr(Qwen3NextModel, 'supports_aux_hidden_states_over_pp', False):
+                    raise RuntimeError('installed Qwen3NextModel lacks auxiliary hidden-state relay across PP stages')
+                target = ParallelConfig(tensor_parallel_size=int(target_tp),
+                                        pipeline_parallel_size=int(target_pp),
+                                        nnodes=int(nodes), distributed_executor_backend='mp')
+                draft = SpeculativeConfig.create_draft_parallel_config(target, int(draft_tp))
+                if draft.pipeline_parallel_size != 1:
+                    raise RuntimeError('this build inherits target PP for the draft')
+                if not callable(getattr(model_runner, 'verify_supports_aux_hidden_states_over_pp', None)):
+                    raise RuntimeError('Model Runner V2 lacks auxiliary hidden-state relay validation')
         except (ImportError, AttributeError, TypeError, ValueError, RuntimeError) as exc:
-            sys.exit(f'PP/speculation preflight failed: {exc}. Install a vLLM build '
-                     'with draft PP=1 and auxiliary hidden-state relay across PP stages, '
-                     'or use SPEC_METHOD=none / PP_SIZE=1.')
-        print(f'Speculative parallelism: target TP={target_tp} PP={target_pp}; '
-              f'draft TP={draft_tp} PP=1. Model-specific relay support is checked '
-              'by vLLM during model loading.', file=sys.stderr)
+            sys.exit(f'PP/speculation preflight failed: {exc}. Use SPEC_METHOD=none, '
+                     'or PP_SIZE=1 and TP_SIZE equal to the total GPU count. '
+                     'PP drafting requires a build implementing model-specific relay; '
+                     'setting a capability flag alone does not implement it.')
+        print(f'Speculation capability preflight passed: target TP={target_tp} PP={target_pp}; '
+              f'draft TP={draft_tp} PP=1. Runtime/weights/backend compatibility still '
+              'requires an actual inference test.', file=sys.stderr)
 print(json.dumps(config, separators=(',', ':')))
 PY
-        )
+        ) || die 'Could not build speculative configuration.'
         if [[ $SPEC_METHOD != ngram ]] && (( MAX_MODEL_LEN > NATIVE_CONTEXT )); then
             warn 'Target YaRN does not extend the drafter; establish a non-speculative long-context baseline first.'
         fi ;;
@@ -437,7 +482,7 @@ esac
 # Same engine arguments on all ranks. Frontend-only options are added on rank 0.
 engine_args=(
     --tensor-parallel-size "$TP_SIZE"             # Total ranks sharding tensors.
-    --pipeline-parallel-size "$PP_SIZE"           # Pipeline stages (default number of nodes).
+    --pipeline-parallel-size "$PP_SIZE"           # Pipeline stages (default 2).
     --distributed-executor-backend mp             # Per-node multiprocessing, no Ray.
     --nnodes "$NUM_NODES"                        # Number of participating hosts.
     --master-addr "$HEAD_IP"                      # Shared rendezvous address, owned by head.
@@ -471,8 +516,13 @@ fi
 
 # Fingerprint excludes node rank, local model path, NIC, HTTP bind, and API key.
 # It includes config.json contents, NOT the full weight files or runtime versions.
+# Include runner/length environment switches; unset is distinct from explicitly 0.
 fingerprint=$("$PYTHON" - "$MODEL_CONFIG_SHA" "$TOOL_CALL_PARSER" "$SERVED_MODEL_NAME" \
-    "$ENABLE_AUTO_TOOL_CHOICE" "$NET_TRANSPORT" "${NODES[@]}" -- "${engine_args[@]}" <<'PY'
+    "$ENABLE_AUTO_TOOL_CHOICE" "$NET_TRANSPORT" \
+    "runner_v2=${VLLM_USE_V2_MODEL_RUNNER-<unset>}" \
+    "qwen3next_patch=$QWEN3NEXT_PATCH_ID" \
+    "allow_long=${VLLM_ALLOW_LONG_MAX_MODEL_LEN-<unset>}" \
+    "${NODES[@]}" -- "${engine_args[@]}" <<'PY'
 import hashlib, json, sys
 print(hashlib.sha256(json.dumps(sys.argv[1:], separators=(',', ':')).encode()).hexdigest()[:16])
 PY

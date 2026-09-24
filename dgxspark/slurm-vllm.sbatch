@@ -32,13 +32,15 @@
 #   SERVICE_PORT=8040 VLLM_PUBLIC_BASE_URL=http://dgx.example.org:8040 \
 #     sbatch --chdir="$PWD/logs" "$PWD/dgxspark/slurm-vllm.sbatch"
 #
-# Defaults preserve your requested 1M / 8 sequences / DFlash 15 setup. This is
-# an experimental combination, not a verified capacity/performance guarantee.
+# Defaults: target TP=2/PP=2, speculation off, 1M context and 8 sequences.
+# The topology and speculative method match launch-vllm.sh; batch concurrency
+# is explicitly higher. Extended context remains experimental.
 # Use the non-speculative 128K example above to isolate startup problems.
 # The batch allocation stays active while vLLM runs; cancellation/time limit
 # stops the serving step. Dry-run also uses an allocation but loads no weights.
 
 set -euo pipefail
+(( BASH_VERSINFO[0] >= 4 )) || { printf 'Bash 4 or later is required.\n' >&2; exit 1; }
 die() { printf 'slurm-vllm.sbatch: %s\n' "$*" >&2; exit 1; }
 positive_int() {
     local name=$1 value=${!1}
@@ -120,12 +122,12 @@ export NUM_NODES=${#hosts[@]}
 export SLURM_EXPORT_ENV=ALL
 export NET_TRANSPORT=${NET_TRANSPORT:-rdma}
 export MASTER_PORT=${MASTER_PORT:-8041}
-# One GPU per node: one pipeline stage per node, no tensor sharding.
-export TP_SIZE=${TP_SIZE:-1}
-export PP_SIZE=${PP_SIZE:-$NUM_NODES}
+# Match the launcher's four-GPU baseline. Other allocations need explicit TP/PP.
+export TP_SIZE=${TP_SIZE:-2}
+export PP_SIZE=${PP_SIZE:-2}
 positive_int TP_SIZE
 positive_int PP_SIZE
-(( TP_SIZE * PP_SIZE == NUM_NODES )) || die 'For this one-GPU-per-node job, TP_SIZE * PP_SIZE must equal NUM_NODES.'
+(( TP_SIZE * PP_SIZE == NUM_NODES )) || die "For this one-GPU-per-node job, TP_SIZE=$TP_SIZE * PP_SIZE=$PP_SIZE must equal NUM_NODES=$NUM_NODES. Set both TP_SIZE and PP_SIZE for a different topology."
 export PYTHONUNBUFFERED=1
 unset NODE_RANK LOCAL_NODE_NAME
 
@@ -133,7 +135,7 @@ unset NODE_RANK LOCAL_NODE_NAME
 export MAX_NUM_SEQS=${MAX_NUM_SEQS:-8}
 export MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS:-8192}
 export CONTEXT_PROFILE=${CONTEXT_PROFILE:-1m}
-export SPEC_METHOD=${SPEC_METHOD:-ngram}
+export SPEC_METHOD=${SPEC_METHOD:-none}
 case $SPEC_METHOD in
     dflash|eagle3)
         if [[ -z ${SPEC_MODEL:-} ]]; then
@@ -145,7 +147,13 @@ case $SPEC_METHOD in
         if [[ $SPEC_METHOD == dflash ]]; then
             export SPEC_TOKENS=${SPEC_TOKENS:-15}
         fi ;;
-    none|ngram) ;; # These methods do not use an auxiliary model.
+    none)
+        [[ -z ${SPEC_MODEL:-} && -z ${SPEC_TOKENS:-} ]] ||
+            die 'SPEC_METHOD=none requires SPEC_MODEL and SPEC_TOKENS to be unset.' ;;
+    ngram)
+        (( PP_SIZE == 1 )) || die 'N-gram preset requires PP_SIZE=1; set TP_SIZE to the allocated GPU count.'
+        [[ -z ${SPEC_MODEL:-} ]] || die 'N-gram drafting does not use SPEC_MODEL.'
+        [[ ${VLLM_USE_V2_MODEL_RUNNER:-0} != 1 ]] || die 'N-gram preset does not support VLLM_USE_V2_MODEL_RUNNER=1.' ;;
     *) die 'SPEC_METHOD must be none, ngram, dflash, or eagle3.' ;;
 esac
 # Draft PP is fixed to 1 by compatible vLLM builds, not a CLI option.
@@ -156,6 +164,10 @@ export VLLM_MIDDLEWARE_DIR=${VLLM_MIDDLEWARE_DIR:-$DEPLOY_KIT_ROOT/vllm_middlewa
 export VLLM_UI_DIR=${VLLM_UI_DIR:-$DEPLOY_KIT_ROOT/ui}
 export VLLM_UI_PAGE=${VLLM_UI_PAGE:-chat.html}
 export VLLM_PUBLIC_BASE_URL=${VLLM_PUBLIC_BASE_URL:-}
+# Resolve caller-relative UI paths before the serving step changes directory.
+for path_name in VLLM_MIDDLEWARE_DIR VLLM_UI_DIR; do
+    [[ ${!path_name} == /* ]] || printf -v "$path_name" '%s/%s' "$PWD" "${!path_name}"
+done
 # Empty public URL => browser same origin, including external port or SSH tunnel.
 # Explicit public URL is the server root WITHOUT /v1; it does not change binding.
 
@@ -189,6 +201,7 @@ cat -- "$HOSTFILE"
 # --mpi=none avoids MPI integration; --kill-on-bad-exit stops peers on failure.
 srun --mpi=none --nodes="$NUM_NODES" --ntasks="$NUM_NODES" \
     --ntasks-per-node=1 --kill-on-bad-exit=1 --export=ALL \
+    --chdir="$JOB_WORK_DIR" \
     --output="$run_dir/node-%N.log" --error="$run_dir/node-%N.log" \
     bash -c '
         set -euo pipefail
