@@ -121,8 +121,8 @@ export SLURM_EXPORT_ENV=ALL
 export NET_TRANSPORT=${NET_TRANSPORT:-rdma}
 export MASTER_PORT=${MASTER_PORT:-8041}
 # One GPU per node: one pipeline stage per node, no tensor sharding.
-export TP_SIZE=${TP_SIZE:-$NUM_NODES}
-export PP_SIZE=${PP_SIZE:-1}
+export TP_SIZE=${TP_SIZE:-1}
+export PP_SIZE=${PP_SIZE:-$NUM_NODES}
 positive_int TP_SIZE
 positive_int PP_SIZE
 (( TP_SIZE * PP_SIZE == NUM_NODES )) || die 'For this one-GPU-per-node job, TP_SIZE * PP_SIZE must equal NUM_NODES.'
@@ -133,7 +133,7 @@ unset NODE_RANK LOCAL_NODE_NAME
 export MAX_NUM_SEQS=${MAX_NUM_SEQS:-8}
 export MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS:-8192}
 export CONTEXT_PROFILE=${CONTEXT_PROFILE:-1m}
-export SPEC_METHOD=${SPEC_METHOD:-dflash}
+export SPEC_METHOD=${SPEC_METHOD:-ngram}
 case $SPEC_METHOD in
     dflash|eagle3)
         if [[ -z ${SPEC_MODEL:-} ]]; then
