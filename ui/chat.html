@@ -73,7 +73,7 @@ This software is provided by the copyright holders and contributors “as is” 
         }
 
         main {
-            max-width: 1180px;
+            max-width: 1800px;
             margin: auto;
             padding: 28px
         }
@@ -97,7 +97,7 @@ This software is provided by the copyright holders and contributors “as is” 
 
         .layout {
             display: grid;
-            grid-template-columns: 280px minmax(0, 1fr);
+            grid-template-columns: 240px minmax(320px, 1fr) minmax(340px, 440px);
             gap: 24px
         }
 
@@ -211,7 +211,7 @@ This software is provided by the copyright holders and contributors “as is” 
 
         #chat {
             min-height: 320px;
-            max-height: 57vh;
+            max-height: 68vh;
             overflow: auto;
             scroll-behavior: smooth;
             padding: 0 6px 10px 0
@@ -319,6 +319,21 @@ This software is provided by the copyright holders and contributors “as is” 
             background: var(--panel);
             font-size: 12px;
             color: var(--muted)
+        }
+
+        .chat-panel { min-width: 0 }
+        .monitor-panel { min-width: 0; padding: 14px; position: sticky; top: 16px; max-height: calc(100vh - 32px); overflow: auto }
+        .monitor-panel h2 { margin: 0; font-size: 17px }
+        .monitor-panel .metrics { gap: 6px; margin-top: 12px }
+        .monitor-panel .metric { padding: 8px }
+        .monitor-panel .metric .value { font-size: 20px }
+        .monitor-panel .metric .name { font-size: 11px }
+        .monitor-panel .throughput { padding: 10px; margin-top: 10px }
+        .monitor-select { width: 100%; margin-top: 6px; padding: 8px; color: inherit; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; font: inherit }
+        .response-stats { font-size: 12px; color: var(--muted) }
+        @media(max-width:1150px) {
+            .layout { grid-template-columns: 210px minmax(0, 1fr) }
+            .monitor-panel { grid-column: 2; position: static; max-height: none }
         }
 
         .throughput-header {
@@ -530,6 +545,7 @@ This software is provided by the copyright holders and contributors “as is” 
             .layout {
                 grid-template-columns: 1fr
             }
+            .monitor-panel { grid-column: auto }
 
             aside {
                 padding: 16px
@@ -610,7 +626,25 @@ This software is provided by the copyright holders and contributors “as is” 
                         to observed values within 1.5 times the interquartile range, with dots for outliers.</p>
                 </details>
             </aside>
-            <section>
+            <section class="chat-panel" aria-label="Conversation">
+                <div id="chat">
+                    <div class="empty"><strong>Your model, live.</strong>Connect an endpoint and send a
+                        message.<br>Streaming Markdown · timing · token usage</div>
+                </div>
+                <div id="error" role="alert"></div>
+                <form id="form"><label for="prompt" class="small">Message</label><textarea id="prompt"
+                        placeholder="Ask your model anything…" required></textarea>
+                    <div class="actions"><span id="status" role="status">Enter to send · Shift+Enter for a new
+                            line</span>
+                        <div><button type="button" id="clear">Clear</button><button type="button" id="stop"
+                                hidden>Stop</button><button class="primary" id="send">Send</button></div>
+                    </div>
+                </form>
+            </section>
+            <aside class="monitor-panel" aria-label="Throughput monitor">
+                <h2>Throughput monitor</h2>
+                <label for="monitorResponse">Response</label>
+                <select id="monitorResponse" class="monitor-select" disabled><option>No responses yet</option></select>
                 <div class="metrics">
                     <div class="metric">
                         <div class="name">TTFT · seconds</div>
@@ -626,20 +660,8 @@ This software is provided by the copyright holders and contributors “as is” 
                     </div>
                 </div>
                 <div id="metricNote">Metrics appear when you send a message.</div>
-                <div id="chat">
-                    <div class="empty"><strong>Your model, live.</strong>Connect an endpoint and send a
-                        message.<br>Streaming Markdown · timing · token usage</div>
-                </div>
-                <div id="error" role="alert"></div>
-                <form id="form"><label for="prompt" class="small">Message</label><textarea id="prompt"
-                        placeholder="Ask your model anything…" required></textarea>
-                    <div class="actions"><span id="status" role="status">Enter to send · Shift+Enter for a new
-                            line</span>
-                        <div><button type="button" id="clear">Clear</button><button type="button" id="stop"
-                                hidden>Stop</button><button class="primary" id="send">Send</button></div>
-                    </div>
-                </form>
-            </section>
+                <div id="monitorCharts"></div>
+            </aside>
         </div>
     </main>
     <script>
@@ -801,6 +823,13 @@ Please report this to https://github.com/markedjs/marked.`, e) { let r = "<p>An 
     <script>
         'use strict';
         const $ = id => document.getElementById(id); let history = [], active = null;
+        const monitoredResponses = [];
+        function showMonitor(s) {
+            for (const response of monitoredResponses) response.chart.hidden = response !== s;
+            $('monitorResponse').value = String(monitoredResponses.indexOf(s));
+            metrics(s); paintRateChart(s);
+        }
+        $('monitorResponse').onchange = () => { const s = monitoredResponses[Number($('monitorResponse').value)]; if (s) showMonitor(s); };
         // Public deployment settings: no keys are sent by the server or stored here.
         function deploymentLocation(location) {
             const hosted = ['http:', 'https:'].includes(location.protocol);
@@ -1140,9 +1169,9 @@ Please report this to https://github.com/markedjs/marked.`, e) { let r = "<p>An 
         function paint(s) { const follow = $('chat').scrollHeight - $('chat').scrollTop - $('chat').clientHeight < 90; if (s.dirty) { renderMarkdown(s.text, s.card.body); s.reasonBody.textContent = s.reason; s.details.hidden = !s.reason; s.dirty = false; } metrics(s); paintRateChart(s); if (follow) $('chat').scrollTop = $('chat').scrollHeight; }
         // Incremental SSE framing handles arbitrary UTF-8/network splits and CR/LF/CRLF.
         class SSEParser { constructor(onEvent) { this.onEvent = onEvent; this.line = ''; this.data = []; this.cr = false; } emit() { if (this.data.length) this.onEvent(this.data.join('\n')); this.data = []; } newline() { if (this.line === '') this.emit(); else if (this.line.startsWith('data:')) this.data.push(this.line.slice(5).replace(/^ /, '')); this.line = ''; } feed(text) { for (const ch of text) { if (this.cr) { this.cr = false; if (ch === '\n') continue; } if (ch === '\r') { this.newline(); this.cr = true; } else if (ch === '\n') this.newline(); else this.line += ch; } } finish() { if (this.line) this.newline(); this.emit(); } }
-        function busy(value) { for (const id of ['send', 'clear', 'base', 'model', 'key', 'system', 'max', 'usage', 'continuous', 'load']) $(id).disabled = value; $('stop').hidden = !value; }
+        function busy(value) { for (const id of ['send', 'clear', 'base', 'model', 'key', 'system', 'max', 'usage', 'continuous', 'load']) $(id).disabled = value; $('stop').hidden = !value; $('monitorResponse').disabled = value || !monitoredResponses.length; }
         $('load').onclick = async () => { await deploymentReady; try { $('error').textContent = ''; $('load').disabled = true; const r = await fetch(endpoint() + '/models', { headers: headers(), signal: AbortSignal.timeout(15000) }); if (!r.ok) throw Error('HTTP ' + r.status + ': ' + await r.text()); const j = await r.json(); const ids = (j.data || []).map(m => m.id).filter(x => typeof x === 'string'); if (!ids.length) throw Error('The endpoint returned no model IDs.'); $('models').replaceChildren(...ids.map(id => { const o = document.createElement('option'); o.value = id; return o; })); if (!$('model').value) $('model').value = ids[0]; $('status').textContent = ids.length + ' model(s) loaded.'; } catch (e) { $('error').textContent = e.message + '\nCheck the endpoint address and CORS settings.'; } finally { $('load').disabled = false; } };
-        $('clear').onclick = () => { history = []; $('chat').replaceChildren(); $('error').textContent = ''; for (const id of ['ttft', 'rate', 'tokens']) $(id).textContent = '—'; $('metricNote').textContent = 'Metrics appear when you send a message.'; $('status').textContent = 'Conversation cleared.'; };
+        $('clear').onclick = () => { history = []; monitoredResponses.length = 0; $('monitorCharts').replaceChildren(); $('monitorResponse').innerHTML = '<option>No responses yet</option>'; $('monitorResponse').disabled = true; $('chat').replaceChildren(); $('error').textContent = ''; for (const id of ['ttft', 'rate', 'tokens']) $(id).textContent = '—'; $('metricNote').textContent = 'Metrics appear when you send a message.'; $('status').textContent = 'Conversation cleared.'; };
         $('stop').onclick = () => active?.controller.abort();
         $('prompt').addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); if (!active) $('form').requestSubmit(); } });
         $('form').onsubmit = async event => {
@@ -1151,7 +1180,7 @@ Please report this to https://github.com/markedjs/marked.`, e) { let r = "<p>An 
             $('error').textContent = ''; const next = [...history, { role: 'user', content }]; const payload = { model: $('model').value.trim(), messages: [$('system').value.trim() ? { role: 'system', content: $('system').value.trim() } : null, ...next].filter(Boolean), stream: true, max_tokens: Number($('max').value) };
             if ($('usage').checked || $('continuous').checked) { payload.stream_options = { include_usage: true }; if ($('continuous').checked) payload.stream_options.continuous_usage_stats = true; }
             card('You').body.textContent = content; const reply = card('Assistant'); const details = document.createElement('details'), summary = document.createElement('summary'), reasonBody = document.createElement('div'); summary.textContent = 'Reasoning'; reasonBody.className = 'reasoning'; details.append(summary, reasonBody); details.hidden = true; reply.el.insertBefore(details, reply.body);
-            const s = { start: performance.now(), end: null, first: null, text: '', reason: '', usage: null, promptTokens: null, card: reply, details, reasonBody, chart: createRateChart(reply.el), rateSeries: new RateSeries(), dirty: false, controller: new AbortController(), done: false, finished: false }; active = s; busy(true); paint(s); $('status').textContent = 'Connecting…'; $('prompt').value = ''; const timer = setInterval(() => paint(s), 80); let success = false;
+            const s = { start: performance.now(), end: null, first: null, text: '', reason: '', usage: null, promptTokens: null, card: reply, details, reasonBody, chart: createRateChart($('monitorCharts')), rateSeries: new RateSeries(), dirty: false, controller: new AbortController(), done: false, finished: false }; monitoredResponses.push(s); if (monitoredResponses.length === 1) $('monitorResponse').replaceChildren(); const option = document.createElement('option'); option.value = String(monitoredResponses.length - 1); option.textContent = 'Response ' + monitoredResponses.length; $('monitorResponse').append(option); active = s; busy(true); showMonitor(s); paint(s); $('status').textContent = 'Connecting…'; $('prompt').value = ''; const timer = setInterval(() => paint(s), 80); let success = false;
             try {
                 const r = await fetch(url + '/chat/completions', { method: 'POST', headers: headers(), body: JSON.stringify(payload), signal: s.controller.signal });
                 if (!r.ok) throw Error('HTTP ' + r.status + ': ' + (await r.text()).slice(0, 4000)); if (!r.body) throw Error('This response has no readable stream.'); if (!(r.headers.get('content-type') || '').includes('text/event-stream')) throw Error('Expected text/event-stream. The endpoint did not return an SSE stream.'); $('status').textContent = 'Streaming…';
@@ -1164,7 +1193,7 @@ Please report this to https://github.com/markedjs/marked.`, e) { let r = "<p>An 
                 const reader = r.body.getReader(), decoder = new TextDecoder(); try { while (!s.done) { const chunk = await reader.read(); if (chunk.done) { parser.feed(decoder.decode()); parser.finish(); break; } parser.feed(decoder.decode(chunk.value, { stream: true })); } } finally { await reader.cancel().catch(() => { }); reader.releaseLock(); }
                 if (!s.done && !s.finished) throw Error('Stream ended without a completion marker. The response may be incomplete.'); if (!s.text && !s.reason) throw Error('No text or reasoning output was returned.'); success = true; history = [...next, { role: 'assistant', content: s.text }]; $('status').textContent = s.finishReason === 'length' ? 'Finished · output token limit reached' : 'Finished';
             } catch (e) { $('status').textContent = e.name === 'AbortError' ? 'Stopped · partial reply excluded from history' : 'Request failed · reply excluded from history'; if (e.name !== 'AbortError') $('error').textContent = e.message + (e instanceof TypeError ? '\nCheck server reachability, CORS, and whether an HTTPS page is calling an HTTP API.' : ''); if (!$('prompt').value) $('prompt').value = content; }
-            finally { s.end = performance.now(); s.rateSeries.finish(s.end); clearInterval(timer); paint(s); const footer = document.createElement('div'); footer.className = 'message-footer'; const copy = document.createElement('button'); copy.type = 'button'; copy.textContent = 'Copy Markdown'; copy.onclick = () => copyText(s.text, copy, reply.body); const note = document.createElement('span'); note.textContent = (success ? 'Complete' : 'Partial / failed') + ' · ' + $('metricNote').textContent; footer.append(copy, note); reply.el.append(footer); active = null; busy(false); $('prompt').focus(); }
+            finally { s.end = performance.now(); s.rateSeries.finish(s.end); clearInterval(timer); paint(s); const footer = document.createElement('div'); footer.className = 'message-footer'; const copy = document.createElement('button'); copy.type = 'button'; copy.textContent = 'Copy Markdown'; copy.onclick = () => copyText(s.text, copy, reply.body); const note = document.createElement('span'); note.textContent = (success ? 'Complete' : 'Partial / failed') + ' · ' + $('metricNote').textContent; const view = document.createElement('button'); view.type = 'button'; view.textContent = 'View metrics'; view.onclick = () => { if (!active) showMonitor(s); }; const stats = s.chart.querySelector('.throughput-stats').cloneNode(true); stats.classList.add('response-stats'); reply.el.append(stats); footer.append(copy, view, note); reply.el.append(footer); active = null; busy(false); $('prompt').focus(); }
         };
     </script>
 </body>

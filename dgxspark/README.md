@@ -13,15 +13,22 @@ The first allocated node runs the HTTP API and web UI.
 TACC-vllm-jobscript/
 ├── dgxspark/
 │   ├── slurm-vllm.sbatch
+│   ├── submit-vllm.sh       # creates logs/ before submission
 │   └── launch-vllm.sh
 ├── models/                 # downloaded checkpoints
 │   └── models.txt          # ordered model IDs
 ├── utility/
 │   ├── installer.sh
 │   ├── inference-network.sh
-│   └── download_model.sh
+│   ├── download_model.sh
+│   ├── benchmark_aiperf.sh
+│   ├── report_aiperf.sh
+│   └── aiperf_tools.py
 ├── vllm_middleware/static_ui.py
 ├── .venv/                  # created by installer.sh
+├── .venv-aiperf/            # AIPerf's separate Python 3.13 environment
+├── logs/                   # batch and per-node logs
+├── aiperf-out/             # benchmark artifacts and generated reports
 └── ui/chat.html
 ```
 
@@ -42,8 +49,7 @@ Use absolute paths for overrides. Relative `NETWORK_SCRIPT`, `MODEL_LIST`,
 `MODEL_REPO`, `MODEL_PATH`, `VLLM_UI_DIR` and `VLLM_MIDDLEWARE_DIR` overrides are
 resolved against `SLURM_SUBMIT_DIR` by the batch script. For direct launches,
 relative file paths use the caller's directory. `SPEC_MODEL` must be an absolute
-local directory or a Hugging Face repository ID. `--chdir` controls logs, not
-helper discovery. Both scripts check that the helper is readable; no copy or symlink into `dgxspark/` is needed.
+local directory or a Hugging Face repository ID. `LOG_DIR` controls node logs; use `submit-vllm.sh` to put batch output in the same directory. `--chdir` does not affect helper discovery. Both scripts check that the helper is readable; no copy or symlink into `dgxspark/` is needed.
 
 ## 1. Prepare the environment
 
@@ -60,6 +66,10 @@ Run the installer on a Linux DGX node with GPU access under your site's
 allocation policy. It currently defaults to Python 3.14 and vLLM 0.30.0,
 overridable through `PYTHON_VERSION` and `VLLM_VERSION`. It creates
 `.venv/` and `models/` at the installer's repository root and checks CUDA visibility.
+It also installs AIPerf in `.venv-aiperf/` with Python 3.13, and creates `logs/`
+and `aiperf-out/`. See the [benchmark guide](../README.md#benchmark-with-aiperf)
+for running `utility/benchmark_aiperf.sh` against a serving job, then building
+`aiperf-out/index.json` and `index.csv` with `utility/report_aiperf.sh`.
 
 Keep the checkout, environment and model files available at the same absolute
 paths on every node. Install separately on each node if the environment is not
@@ -166,9 +176,7 @@ export LOAD_FORMAT=auto
 export SERVICE_PORT=8040
 mkdir -p "$DEPLOY_KIT_ROOT/logs"
 
-sbatch --export=ALL --time=01:00:00 \
-    --chdir="$DEPLOY_KIT_ROOT/logs" \
-    "$DEPLOY_KIT_ROOT/dgxspark/slurm-vllm.sbatch" --dry-run
+bash "$DEPLOY_KIT_ROOT/dgxspark/submit-vllm.sh" --time=01:00:00 --dry-run
 ```
 
 Add your site's required `--account`, `--partition` and GPU request (for example,
@@ -189,9 +197,7 @@ installed build supports the printed options before a full run.
 Keep the exports above in the same shell, then submit without `--dry-run`:
 
 ```bash
-sbatch --export=ALL --time=01:00:00 \
-    --chdir="$DEPLOY_KIT_ROOT/logs" \
-    "$DEPLOY_KIT_ROOT/dgxspark/slurm-vllm.sbatch"
+bash "$DEPLOY_KIT_ROOT/dgxspark/submit-vllm.sh" --time=01:00:00
 ```
 
 Use the job ID printed by `sbatch`:
@@ -213,11 +219,9 @@ The candidate is printed before vLLM is ready. `HEAD_IP:8041` is the engine
 rendezvous endpoint, not the HTTP API. Compare configuration fingerprints across
 node logs; there is no automatic remote consistency check. Fingerprints include
 runner selection and the extended-context environment switch, but do not compare
-weight contents or package versions. The serving step explicitly uses the initial
-job working directory, with absolute paths passed to each launcher.
+weight contents or package versions. The serving step uses the absolute log directory as its working directory, with absolute paths passed to each launcher.
 
-Without `--chdir`, logs go into the submission directory. When submitting from
-outside the checkout, retain the absolute `DEPLOY_KIT_ROOT` export above.
+The submission helper creates `logs/` before Slurm opens stdout and uses absolute paths, including when called outside the checkout. `LOG_DIR` overrides the log root. With raw `sbatch`, submit from the repo root (the `logs/` directory must already exist), or pass explicit `--output`/`--error` paths. Do not use `--chdir=logs` with the relative `#SBATCH --output=logs/...` default.
 
 ## 5. Test the API and open the UI
 
@@ -330,15 +334,15 @@ on your installed build, not measured performance recommendations.
 ```bash
 # Four pipeline stages, no speculative decoding.
 TP_SIZE=1 PP_SIZE=4 SPEC_METHOD=none CONTEXT_PROFILE=128k \
-    sbatch "$DEPLOY_KIT_ROOT/dgxspark/slurm-vllm.sbatch"
+    bash "$DEPLOY_KIT_ROOT/dgxspark/submit-vllm.sh"
 
 # N-gram uses no second model; this launcher requires PP=1 and the V1 runner.
 TP_SIZE=4 PP_SIZE=1 SPEC_METHOD=ngram VLLM_USE_V2_MODEL_RUNNER=0 \
-    CONTEXT_PROFILE=128k sbatch "$DEPLOY_KIT_ROOT/dgxspark/slurm-vllm.sbatch"
+    CONTEXT_PROFILE=128k bash "$DEPLOY_KIT_ROOT/dgxspark/submit-vllm.sh"
 
 # DFlash uses the second model-list entry, with draft TP=1.
 TP_SIZE=4 PP_SIZE=1 SPEC_METHOD=dflash SPEC_TP_SIZE=1 \
-    CONTEXT_PROFILE=128k sbatch "$DEPLOY_KIT_ROOT/dgxspark/slurm-vllm.sbatch"
+    CONTEXT_PROFILE=128k bash "$DEPLOY_KIT_ROOT/dgxspark/submit-vllm.sh"
 ```
 
 EAGLE3 requires `SPEC_METHOD=eagle3` and a compatible EAGLE3 checkpoint as the

@@ -3,4 +3,7 @@
 /models/*
 !/models/models.txt
 __pycache__
-logs
+/.venv-aiperf/
+/logs/*
+!/logs/.gitkeep
+/aiperf-out/

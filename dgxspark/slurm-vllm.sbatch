@@ -3,34 +3,33 @@
 #SBATCH --nodes=4
 #SBATCH --ntasks-per-node=1
 #SBATCH --mem=0
-#SBATCH --output=vllm-run-%j.out
+#SBATCH --output=logs/vllm-run-%j.out
 # Four DGX Spark nodes, one GPU each. Add your site's account, partition,
 # time limit and GPU request as needed (e.g. sbatch --gres=gpu:1 ... if configured).
 # --mem=0 requests all schedulable host memory on each allocated node.
-# Submit from the repo root OR dgxspark/. For another working directory, export
+# Submit through dgxspark/submit-vllm.sh from any directory. For raw sbatch,
+# submit from the repo root with logs/ already present. For another directory, export
 # LAUNCHER=/absolute/path/to/repo/dgxspark/launch-vllm.sh or DEPLOY_KIT_ROOT.
 # Repo layout: dgxspark/{launch-vllm.sh,slurm-vllm.sbatch},
 #             utility/inference-network.sh, vllm_middleware/static_ui.py, ui/chat.html.
 # PROJECT, its venv, weights and this kit must be available on every node.
 #
-# Logs use Slurm's initial working directory (--chdir), captured before any cd:
-#   <job-work-dir>/vllm-run-JOBID.out          batch stdout + stderr
-#   <job-work-dir>/vllm-run-JOBID/hosts.txt    allocated hosts
-#   <job-work-dir>/vllm-run-JOBID/node-*.log   per-node vLLM logs
-# Without --chdir, this is the submission directory. The initial directory
-# must already exist on the nodes; the script creates only the job subdirectory.
-# An explicit --output/--error override can place batch logs somewhere else.
+# Logs default to <repo>/logs, independent of the submission directory:
+#   logs/vllm-run-JOBID.out          batch stdout + stderr
+#   logs/vllm-run-JOBID/hosts.txt    allocated hosts
+#   logs/vllm-run-JOBID/node-*.log   per-node vLLM logs
+# The submission helper creates logs/ before sbatch opens stdout. LOG_DIR can
+# override this root; with raw sbatch also pass matching --output/--error paths.
 #
 # From repo root (absolute script path avoids ambiguity with --chdir):
-#   mkdir -p "$PWD/logs"
-#   sbatch --chdir="$PWD/logs" "$PWD/dgxspark/slurm-vllm.sbatch" --dry-run
-#   sbatch --chdir="$PWD/logs" "$PWD/dgxspark/slurm-vllm.sbatch"
+#   bash dgxspark/submit-vllm.sh --dry-run
+#   bash dgxspark/submit-vllm.sh
 #   CONTEXT_PROFILE=128k SPEC_METHOD=none \
-#     sbatch --chdir="$PWD/logs" "$PWD/dgxspark/slurm-vllm.sbatch"
+#     bash dgxspark/submit-vllm.sh
 #   MAX_NUM_SEQS=4 VLLM_UI_ENABLE=0 \
-#     sbatch --chdir="$PWD/logs" "$PWD/dgxspark/slurm-vllm.sbatch"
+#     bash dgxspark/submit-vllm.sh
 #   SERVICE_PORT=8040 VLLM_PUBLIC_BASE_URL=http://dgx.example.org:8040 \
-#     sbatch --chdir="$PWD/logs" "$PWD/dgxspark/slurm-vllm.sbatch"
+#     bash dgxspark/submit-vllm.sh
 #
 # Defaults: target TP=2/PP=2, speculation off, 1M context and 8 sequences.
 # The topology and speculative method match launch-vllm.sh; batch concurrency
@@ -50,10 +49,6 @@ positive_int() {
 }
 [[ -n ${SLURM_JOB_ID:-} && -n ${SLURM_JOB_NODELIST:-} ]] || die 'Submit this script with sbatch.'
 [[ $# == 0 || ( $# == 1 && $1 == --dry-run ) ]] || die 'Only --dry-run is supported.'
-# Capture the actual initial cwd, including sbatch --chdir, before changing it.
-# Keep this absolute path even after the launcher switches to PROJECT.
-JOB_WORK_DIR=$(pwd -P)
-export JOB_WORK_DIR
 # Launcher discovery and caller-relative configuration use the submission dir.
 cd -- "${SLURM_SUBMIT_DIR:?}"
 
@@ -81,6 +76,11 @@ PROJECT=${PROJECT:-$DEPLOY_KIT_ROOT}
 [[ -d $PROJECT ]] || die "Project directory missing: $PROJECT"
 PROJECT=$(cd -- "$PROJECT" && pwd)
 export LAUNCHER NETWORK_SCRIPT DEPLOY_KIT_ROOT PROJECT
+LOG_DIR=${LOG_DIR:-$DEPLOY_KIT_ROOT/logs}
+[[ $LOG_DIR == /* ]] || LOG_DIR=$PWD/$LOG_DIR
+mkdir -p -- "$LOG_DIR"
+JOB_WORK_DIR=$(cd -- "$LOG_DIR" && pwd)
+export LOG_DIR JOB_WORK_DIR
 
 # First two model IDs select the target and optional auxiliary checkpoint.
 # Explicit submission-time model overrides still take precedence.

@@ -88,12 +88,12 @@ def run(name, overrides=None, dry=False, submit=None, fail=None):
     global count
     count+=1
     work=fixture/name;work.mkdir()
-    env=base_env.copy();env.update(SLURM_JOB_ID=str(count),SLURM_SUBMIT_DIR=str(submit or repo),FAKE_CAPTURE_DIR=str(work))
+    env=base_env.copy();env.update(SLURM_JOB_ID=str(count),SLURM_SUBMIT_DIR=str(submit or repo),FAKE_CAPTURE_DIR=str(work),LOG_DIR=str(work/'logs'))
     for k,v in (overrides or {}).items():
         if v is None: env.pop(k,None)
         else: env[k]=str(v)
     p=subprocess.run([bash,str(repo/'dgxspark/slurm-vllm.sbatch'),*(['--dry-run'] if dry else [])],cwd=work,env=env,text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
-    logs='\n'.join(f.read_text() for f in work.glob('vllm-run-*/node-*.log'))
+    logs='\n'.join(f.read_text() for f in (work/'logs').glob('vllm-run-*/node-*.log'))
     if fail:
         assert p.returncode!=0, (name,'unexpected success')
         assert fail in p.stdout+logs,(name,p.stdout,logs)
@@ -101,7 +101,7 @@ def run(name, overrides=None, dry=False, submit=None, fail=None):
     else:
         assert p.returncode==0,(name,p.stdout,logs)
         assert 'test-key-never-log' not in p.stdout+logs,(name,'key logged')
-        assert len(list(work.glob('vllm-run-*/node-*.log')))==int(env['SLURM_JOB_NUM_NODES'])
+        assert len(list((work/'logs').glob('vllm-run-*/node-*.log')))==int(env['SLURM_JOB_NUM_NODES'])
         if dry: assert not list(work.glob('dgx-*.json'))
     records=[json.loads(f.read_text()) for f in sorted(work.glob('dgx-*.json'))]
     print('PASS',name)
@@ -127,7 +127,7 @@ for i,r in enumerate(records):
         assert r['env']['TACC_UI_DIR']==str(project/'frontend')
     assert r['cwd']==str(project)
 steps=[json.loads(x) for x in (work/'srun.jsonl').read_text().splitlines()]
-assert len(steps)==2 and steps[-1]['cwd']==str(work)
+assert len(steps)==2 and steps[-1]['cwd']==str(work/'logs')
 run('dry-from-dgxspark',dry=True,submit=repo/'dgxspark')
 records,_,_=run('relative-paths',{'LAUNCHER':str(repo/'dgxspark/launch-vllm.sh'),'NETWORK_SCRIPT':'network.sh','VLLM_UI_DIR':'frontend','VLLM_MIDDLEWARE_DIR':'middleware','MODEL_LIST':'models/one.txt','MODEL_REPO':'models'},submit=project)
 assert records[0]['env']['TACC_UI_DIR']==str(project/'frontend')
