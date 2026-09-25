@@ -162,19 +162,33 @@ The updated UI provides:
 - Streaming Markdown and a **Copy code** button attached to each code block.
   A separate **Copy Markdown** button copies the whole response.
 - A live tok/s chart in each assistant response, retained after completion.
+- Live violin and box plots below the monitor, plus **p50, p80, p90, p95, p99,
+  p99.9 and p99.99** for the response's complete one-second windows.
+- A rolling high-speed frequency plot comparing the latest 30 complete windows
+  with the preceding 30. Set a tok/s threshold to see the percentage at or above
+  that speed, and the change in percentage points between groups.
 - **Min, max, mean and median tok/s** at the end of each response, including
   partial responses when stopped or interrupted.
 - Client-observed TTFT, output-token totals and an end-to-end average rate above
   the conversation. These are distinct from the per-window chart rates.
 
 Charts measure arrivals in one-second windows from first output, including
-reasoning and pauses; the final window may be shorter. Summary mean and median
-are computed across these window rates. Both final and continuous usage are
+reasoning and pauses; the final line-chart window may be shorter. Summary
+statistics and distribution plots exclude partial windows so that median and p50
+agree. Responses shorter than one second have no distribution yet. Percentiles
+use linear interpolation; p99.9 and p99.99 on short responses mostly describe
+the maximum, with too few windows to characterize rare speeds. The violin uses
+smoothed density; box whiskers use 1.5×IQR, with outlier dots thinned above 80.
+The rolling frequency view is the most direct way to track how often a chosen
+high speed occurs. Both final and continuous usage are
 requested by default. If the first output delta includes a positive server
 completion-token count, the chart uses server counts. Otherwise it remains an
 explicitly labeled characters-divided-by-four estimate for that response.
 Final-only usage can correct totals, but cannot reconstruct the live chart.
 Network buffering affects the measurements; these are not server-only decode rates.
+
+Run `node tests/check_chat_rates.cjs` for the window, percentile, distribution,
+and SVG checks. The plots use inline SVG with no additional network dependencies.
 
 For APIs that reject stream options, disable both usage checkboxes. Code copying
 tries the Clipboard API, then a fallback for HTTP deployments, then manual

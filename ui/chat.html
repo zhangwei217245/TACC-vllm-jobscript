@@ -356,6 +356,56 @@ This software is provided by the copyright holders and contributors “as is” 
             display: none
         }
 
+        .rate-distribution {
+            border-top: 1px solid var(--line);
+            margin-top: 12px;
+            padding-top: 12px
+        }
+
+        .rate-distribution h3 {
+            margin: 0 0 4px;
+            color: #edf2f7;
+            font-size: 13px
+        }
+
+        .rate-distribution figure {
+            margin: 14px 0 0
+        }
+
+        .rate-distribution figcaption {
+            color: #edf2f7;
+            font-weight: 600
+        }
+
+        .rate-distribution svg {
+            height: auto;
+            overflow: visible
+        }
+
+        .rate-percentiles {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(85px, 1fr));
+            gap: 6px;
+            margin-top: 10px
+        }
+
+        .rate-percentiles div {
+            padding: 7px 9px;
+            background: var(--bg);
+            border: 1px solid var(--line);
+            border-radius: 7px
+        }
+
+        .rate-percentiles dt { font-size: 11px }
+        .rate-percentiles dd { margin: 0; color: #edf2f7; font-variant-numeric: tabular-nums }
+        .rate-tail-controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 8px }
+        .rate-tail-controls label { margin: 0; font-size: 12px }
+        .rate-tail-controls input { width: 90px; padding: 4px 8px }
+        .rate-tail-result { color: var(--accent); font-variant-numeric: tabular-nums }
+        .rate-legend { display: flex; flex-wrap: wrap; gap: 8px 18px }
+        .rate-legend span::before { content: ''; display: inline-block; width: 18px; margin-right: 5px; vertical-align: middle; border-top: 2px solid var(--accent) }
+        .rate-legend .previous::before { border-color: #a6b6ff; border-top-style: dashed }
+
         .body blockquote {
             margin-left: 0;
             border-left: 3px solid var(--accent);
@@ -545,11 +595,19 @@ This software is provided by the copyright holders and contributors “as is” 
                     <p>Server usage replaces the estimate when available. Continuous usage is a vLLM extension. No
                         settings, keys, or conversations are saved by this page.</p>
                     <p>Each response chart shows client-observed output arrival rate in one-second windows from
-                        first output, including reasoning and pauses. The final window may be shorter. Min, max,
-                        mean and median describe these window rates; mean is their arithmetic average.</p>
+                        first output, including reasoning and pauses. The final chart window may be shorter.
+                        Min, max, mean and median use complete one-second windows, matching the percentiles;
+                        mean is their arithmetic average.</p>
                     <p>Charts use server counts when supplied with the first output delta; otherwise they use
                         characters ÷ 4 throughout. Final-only usage updates the total above, but cannot reconstruct
                         token arrival times. Network buffering can affect every chart.</p>
+                    <p>Violin, box plot, and percentiles use only complete one-second windows of this response,
+                        including zero-output pauses. Partial windows are excluded. Percentiles use linear interpolation;
+                        extreme percentiles can be almost identical to the maximum on short responses.</p>
+                    <p>The high-speed frequency plot compares the latest 30 complete windows with the preceding 30.
+                        Its height is the percentage of windows at or above a speed. Raise the threshold to track
+                        how often higher speeds occur. The violin is a smoothed distribution; box whiskers extend
+                        to observed values within 1.5 times the interquartile range, with dots for outliers.</p>
                 </details>
             </aside>
             <section>
@@ -860,7 +918,7 @@ Please report this to https://github.com/markedjs/marked.`, e) { let r = "<p>An 
                 if (seconds <= 0) return [];
                 return Array.from({ length: Math.ceil(seconds) }, (_, i) => {
                     const duration = Math.min(1, seconds - i);
-                    return { time: i + duration, rate: (this.buckets[i] || 0) / duration };
+                    return { time: i + duration, duration, rate: (this.buckets[i] || 0) / duration };
                 });
             }
         }
@@ -869,6 +927,155 @@ Please report this to https://github.com/markedjs/marked.`, e) { let r = "<p>An 
             const values = samples.map(p => p.rate).sort((a, b) => a - b), middle = Math.floor(values.length / 2);
             return { min: values[0], max: values[values.length - 1], mean: values.reduce((a, b) => a + b, 0) / values.length,
                 median: values.length % 2 ? values[middle] : (values[middle - 1] + values[middle]) / 2 };
+        }
+        const RATE_PERCENTILES = [50, 80, 90, 95, 99, 99.9, 99.99];
+        // Linear interpolation on ordered window rates, not on SSE chunk sizes.
+        function rateQuantile(sorted, p) {
+            if (!sorted.length) return null;
+            const index = (sorted.length - 1) * p, low = Math.floor(index), fraction = index - low;
+            return sorted[low] + (sorted[Math.min(low + 1, sorted.length - 1)] - sorted[low]) * fraction;
+        }
+        function rateDistribution(samples) {
+            const values = samples.filter(p => p.duration === 1 && Number.isFinite(p.rate) && p.rate >= 0).map(p => p.rate);
+            if (!values.length) return null;
+            const sorted = [...values].sort((a, b) => a - b), q1 = rateQuantile(sorted, .25), q3 = rateQuantile(sorted, .75);
+            const iqr = q3 - q1, lower = q1 - 1.5 * iqr, upper = q3 + 1.5 * iqr;
+            return { sorted, q1, q3, median: rateQuantile(sorted, .5),
+                low: sorted.find(v => v >= lower), high: sorted.findLast(v => v <= upper),
+                outliers: sorted.filter(v => v < lower || v > upper),
+                recent: values.slice(-30).sort((a, b) => a - b),
+                previous: values.slice(-60, -30).sort((a, b) => a - b) };
+        }
+        function rateShareAtLeast(sorted, threshold) {
+            if (!sorted.length) return null;
+            let low = 0, high = sorted.length;
+            while (low < high) {
+                const mid = (low + high) >>> 1;
+                if (sorted[mid] < threshold) low = mid + 1; else high = mid;
+            }
+            return (sorted.length - low) / sorted.length;
+        }
+        // Binned Gaussian density keeps rendering cost bounded for long replies.
+        // The violin is descriptive smoothing, not a probability scale.
+        function rateDensity(sorted, scale) {
+            const bins = new Array(64).fill(0);
+            for (const v of sorted) bins[Math.min(63, Math.floor(v / scale * 64))]++;
+            const mean = sorted.reduce((a, b) => a + b, 0) / sorted.length;
+            const sd = Math.sqrt(sorted.reduce((sum, v) => sum + (v - mean) ** 2, 0) / sorted.length);
+            const bandwidth = Math.max(scale / 64, 1.06 * sd * sorted.length ** -.2);
+            const density = Array.from({ length: 81 }, (_, i) => {
+                const x = i / 80 * scale;
+                // Reflect at zero: speeds cannot be negative.
+                return bins.reduce((sum, count, j) => {
+                    const center = (j + .5) / 64 * scale;
+                    return sum + count * (Math.exp(-.5 * ((x - center) / bandwidth) ** 2)
+                        + Math.exp(-.5 * ((x + center) / bandwidth) ** 2));
+                }, 0);
+            });
+            const peak = Math.max(...density);
+            return density.map(value => value / peak);
+        }
+        function rateSVG(svg, markup, label) {
+            // Only program-generated numeric geometry and fixed labels enter SVG.
+            svg.innerHTML = markup; svg.setAttribute('aria-label', label);
+        }
+        function rateAxis(scale, y) {
+            return `<path d="M48 ${y}H588" stroke="var(--line)"/>` + [0, .25, .5, .75, 1].map(f =>
+                `<text x="${48 + 540 * f}" y="${y + 19}" text-anchor="${f === 0 ? 'start' : f === 1 ? 'end' : 'middle'}" fill="currentColor" font-size="12">${(scale * f).toFixed(1)}</text>`).join('');
+        }
+        function createRateDistribution(chart) {
+            const el = document.createElement('section'); el.className = 'rate-distribution';
+            el.innerHTML = `<h3>Speed distribution · tok/s</h3>
+                <div class="distribution-note">Waiting for a complete one-second window…</div>
+                <dl class="rate-percentiles">${RATE_PERCENTILES.map(p => `<div><dt>p${p}</dt><dd data-percentile="${p}">—</dd></div>`).join('')}</dl>
+                <div class="rate-tail-note">Whole-response percentiles · complete windows only</div>
+                <figure><figcaption>Violin · whole response</figcaption>
+                    <svg class="rate-violin" viewBox="0 0 600 116" role="img" aria-label="Violin plot: waiting for samples"></svg>
+                    <div>Wider sections indicate more frequent speeds; density is smoothed.</div></figure>
+                <figure><figcaption>Box plot · whole response</figcaption>
+                    <svg class="rate-box" viewBox="0 0 600 92" role="img" aria-label="Box plot: waiting for samples"></svg>
+                    <div>Box: p25–p75 · line: p50 · whiskers: 1.5×IQR · dots: outliers</div></figure>
+                <figure><figcaption>High-speed frequency · rolling comparison</figcaption>
+                    <div class="rate-legend"><span class="recent">Latest 30 windows</span><span class="previous">Previous 30 windows</span></div>
+                    <svg class="rate-exceedance" viewBox="0 0 600 154" role="img" aria-label="High-speed frequency plot: waiting for samples"></svg>
+                    <div>Vertical: % of windows at or above speed · horizontal: tok/s. Higher means more frequent.</div>
+                    <div class="rate-tail-controls"><label>Track ≥ <input class="rate-threshold" type="number" min="0" step="any" value="20" aria-label="High-speed threshold in tokens per second"> tok/s</label>
+                        <span class="rate-tail-result">Waiting for samples…</span></div>
+                </figure>`;
+            chart.append(el);
+            const threshold = el.querySelector('.rate-threshold');
+            threshold.addEventListener('input', () => { if (chart.rateDistribution) paintRateTail(chart, chart.rateDistribution); });
+        }
+        function paintRateTail(chart, dist) {
+            const input = chart.querySelector('.rate-threshold'), threshold = Number(input.value);
+            const valid = input.value.trim() !== '' && Number.isFinite(threshold) && threshold >= 0;
+            const scale = Math.max(1, dist.recent.at(-1) || 0, dist.previous.at(-1) || 0, valid ? threshold : 0) * 1.08;
+            const x = v => 48 + v / scale * 540, y = fraction => 116 - fraction * 96;
+            let markup = rateAxis(scale, 116);
+            for (const f of [0, .5, 1]) markup += `<path d="M48 ${y(f)}H588" stroke="var(--line)"/><text x="40" y="${y(f) + 4}" text-anchor="end" fill="currentColor" font-size="12">${f * 100}%</text>`;
+            // Exact empirical staircases (at most 30 observations per curve).
+            for (const [values, color, dash] of [[dist.previous, '#a6b6ff', '5 4'], [dist.recent, 'var(--accent)', '']]) {
+                if (!values.length) continue;
+                let path = `M48 ${y(1)}`;
+                for (let i = 0; i < values.length;) {
+                    const value = values[i]; let next = i + 1;
+                    while (next < values.length && values[next] === value) next++;
+                    path += `H${x(value).toFixed(2)}V${y((values.length - next) / values.length).toFixed(2)}`;
+                    i = next;
+                }
+                path += 'H588';
+                markup += `<path d="${path}" fill="none" stroke="${color}" stroke-width="2" stroke-dasharray="${dash}"/>`;
+            }
+            const result = chart.querySelector('.rate-tail-result');
+            if (valid) {
+                const recent = rateShareAtLeast(dist.recent, threshold), previous = rateShareAtLeast(dist.previous, threshold);
+                markup += `<path d="M${x(threshold)} 20V116" stroke="#f6ce83" stroke-dasharray="3 3"/><circle cx="${x(threshold)}" cy="${y(recent)}" r="4" fill="var(--accent)"/>`;
+                result.textContent = `${(recent * 100).toFixed(1)}% of latest ${dist.recent.length} windows` +
+                    (previous === null ? ' · previous window group pending' : ` · previous ${dist.previous.length}: ${(previous * 100).toFixed(1)}% · change ${recent >= previous ? '+' : ''}${((recent - previous) * 100).toFixed(1)} pp`);
+            } else result.textContent = 'Enter a nonnegative speed threshold.';
+            rateSVG(chart.querySelector('.rate-exceedance'), markup, `High-speed frequency. ${result.textContent}`);
+        }
+        function paintRateDistribution(s, samples) {
+            const chart = s.chart, n = samples.filter(p => p.duration === 1).length;
+            const key = `${n}:${s.end !== null}`;
+            if (chart.distributionKey === key) return;
+            chart.distributionKey = key;
+            const dist = rateDistribution(samples); chart.rateDistribution = dist;
+            const note = chart.querySelector('.distribution-note');
+            if (!dist) {
+                note.textContent = s.end === null ? 'Waiting for a complete one-second window…' : 'No complete one-second windows; distribution unavailable for this response.';
+                return;
+            }
+            const approx = s.rateSeries.source === 'estimate' ? '≈' : '';
+            note.textContent = `${s.end === null ? 'Live' : 'Final'} · ${dist.sorted.length} complete 1 s windows · pauses included · partial windows excluded`;
+            for (const p of RATE_PERCENTILES) {
+                const cell = chart.querySelector(`[data-percentile="${p}"]`);
+                cell.textContent = approx + rateQuantile(dist.sorted, p / 100).toFixed(2);
+                cell.title = `p${p} of ${n} one-second rates (tok/s), linearly interpolated.`;
+            }
+            chart.querySelector('.rate-tail-note').textContent = n < 10000
+                ? 'Tail estimates are sparse: p99.9 needs ~1,000 windows and p99.99 ~10,000 just to represent one upper-tail observation; short-run values sit near the maximum.'
+                : 'Percentiles use linear interpolation across all complete windows; tail estimates are descriptive, not confidence bounds.';
+            const scale = Math.max(1, dist.sorted.at(-1)) * 1.08, x = v => 48 + v / scale * 540;
+            const violin = chart.querySelector('.rate-violin');
+            if (dist.sorted[0] === dist.sorted.at(-1)) {
+                rateSVG(violin, rateAxis(scale, 88) + `<path d="M${x(dist.median)} 18V78" stroke="var(--accent)" stroke-width="3"/>`,
+                    `Violin plot: all ${n} windows have the same rate, ${approx}${dist.median.toFixed(2)} tok/s. No density spread.`);
+            } else {
+                const density = rateDensity(dist.sorted, scale);
+                const top = density.map((v, i) => `${48 + i / 80 * 540},${48 - v * 30}`);
+                const bottom = density.map((v, i) => `${48 + i / 80 * 540},${48 + v * 30}`).reverse();
+                rateSVG(violin, rateAxis(scale, 88) + `<polygon points="${top.concat(bottom).join(' ')}" fill="var(--accent)" fill-opacity=".22" stroke="var(--accent)"/><path d="M${x(dist.median)} 18V78" stroke="#edf2f7" stroke-width="2"/>`,
+                    `Smoothed violin of ${n} one-second rates. Median ${approx}${dist.median.toFixed(2)} tok/s.`);
+            }
+            const outlierStride = Math.max(1, Math.ceil(dist.outliers.length / 80));
+            const dots = dist.outliers.filter((_, i) => i % outlierStride === 0 || i === dist.outliers.length - 1).map(v => `<circle cx="${x(v)}" cy="34" r="2.5" fill="#f6ce83"/>`).join('');
+            rateSVG(chart.querySelector('.rate-box'), rateAxis(scale, 62) +
+                `<path d="M${x(dist.low)} 34H${x(dist.high)} M${x(dist.low)} 24V44 M${x(dist.high)} 24V44" stroke="var(--accent)"/>
+                <rect x="${x(dist.q1)}" y="20" width="${Math.max(0, x(dist.q3) - x(dist.q1))}" height="28" fill="#29483f" stroke="var(--accent)"/>
+                <path d="M${x(dist.median)} 20V48" stroke="#edf2f7" stroke-width="2"/>${dots}`,
+                `Box plot in tok/s. p25 ${approx}${dist.q1.toFixed(2)}, p50 ${approx}${dist.median.toFixed(2)}, p75 ${approx}${dist.q3.toFixed(2)}. Whiskers ${dist.low.toFixed(2)} to ${dist.high.toFixed(2)}. ${dist.outliers.length} outliers; dots thinned above 80.`);
+            paintRateTail(chart, dist);
         }
         function createRateChart(parent) {
             const chart = document.createElement('div'); chart.className = 'throughput';
@@ -882,10 +1089,11 @@ Please report this to https://github.com/markedjs/marked.`, e) { let r = "<p>An 
                     <text x="52" y="108" fill="currentColor" font-size="11">0 s</text>
                     <text class="rate-time" x="588" y="108" text-anchor="end" fill="currentColor" font-size="11">Since first output</text>
                 </svg><div class="rate-note">One-second windows · client-observed arrivals</div><div class="throughput-stats" hidden></div>`;
-            parent.append(chart); return chart;
+            createRateDistribution(chart); parent.append(chart); return chart;
         }
         function paintRateChart(s) {
             const chart = s.chart, series = s.rateSeries, samples = series.samples(performance.now());
+            paintRateDistribution(s, samples);
             if (!samples.length) {
                 if (s.end !== null) {
                     chart.querySelector('.throughput-current').textContent = 'No rate samples';
@@ -910,11 +1118,14 @@ Please report this to https://github.com/markedjs/marked.`, e) { let r = "<p>An 
             chart.querySelector('.rate-note').textContent = `${series.source === 'server' ? 'Server token counts' : 'Estimated tokens · characters ÷ 4'} · client arrival timing · 1 s windows (last may be shorter)`;
             if (s.end !== null) {
                 const summary = chart.querySelector('.throughput-stats'); summary.hidden = false;
-                summary.replaceChildren(...Object.entries(stats).map(([name, value]) => {
+                const summaryStats = rateStats(samples.filter(p => p.duration === 1));
+                if (!summaryStats) { summary.textContent = 'Min / max / mean / median: no complete 1 s windows'; return; }
+                summary.replaceChildren(...Object.entries(summaryStats).map(([name, value]) => {
                     const item = document.createElement('span'), number = document.createElement('strong');
                     number.textContent = approx + value.toFixed(1);
                     item.append(name[0].toUpperCase() + name.slice(1) + ' ', number, ' tok/s'); return item;
                 }));
+                summary.append('Complete 1 s windows');
             }
         }
         function endpoint() { const url = new URL($('base').value.trim()); if (!['http:', 'https:'].includes(url.protocol)) throw Error('Use an http:// or https:// API URL.'); return url.href.replace(/\/+$/, ''); }
